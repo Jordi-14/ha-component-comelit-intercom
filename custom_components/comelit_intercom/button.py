@@ -66,11 +66,13 @@ class ComelitDoorButton(CoordinatorEntity[ComelitDataUpdateCoordinator], ButtonE
 
     async def async_press(self) -> None:
         """Handle the button press."""
-        await self.coordinator.async_open_door(self._door.get("name", ""))
+        await self.coordinator.async_open_door(self._door)
 
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        return self.coordinator.last_update_success and self._door.get("name") in [
-            d.get("name") for d in self.coordinator.data.get("doors", [])
-        ]
+        return self.coordinator.last_update_success and any(
+            d.get("apt-address") == self._door.get("apt-address")
+            and str(d.get("output-index")) == str(self._door.get("output-index"))
+            for d in self.coordinator.data.get("doors", [])
+        )

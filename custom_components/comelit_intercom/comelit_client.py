@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
+from .control_discovery import extract_controls_from_vip
+
 # Protocol Constants
 ICONA_BRIDGE_PORT = 64100  # TCP port for ICONA Bridge protocol
 HEADER_MAGIC = b"\x00\x06"  # All messages start with these magic bytes
@@ -392,14 +394,10 @@ class IconaBridgeClient:
         return None
 
     async def list_doors(self) -> list[dict]:
-        """List all available doors"""
+        """List all available doors and compatible relay controls."""
         config = await self.get_config("all")
         if config and "vip" in config:
-            return (
-                config["vip"]
-                .get("user-parameters", {})
-                .get("opendoor-address-book", [])
-            )
+            return extract_controls_from_vip(config["vip"])
         return []
 
     def _string_to_buffer(self, s: str, null_terminated: bool = False) -> bytes:
@@ -566,7 +564,7 @@ async def open_door(host: str, token: str, door_name: str) -> bool:
             raise Exception("Failed to get configuration")
 
         vip = config["vip"]
-        doors = vip.get("user-parameters", {}).get("opendoor-address-book", [])
+        doors = extract_controls_from_vip(vip)
 
         # Find the door by name
         door = next((d for d in doors if d.get("name") == door_name), None)

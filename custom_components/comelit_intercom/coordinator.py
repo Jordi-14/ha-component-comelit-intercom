@@ -13,6 +13,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .comelit_client import IconaBridgeClient
 from .const import CONF_HOST, CONF_TOKEN, DOMAIN, UPDATE_INTERVAL
+from .control_discovery import extract_controls_from_vip
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -53,9 +54,7 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise UpdateFailed("Failed to get configuration from device")
 
             self.vip_config = config["vip"]
-            doors = self.vip_config.get("user-parameters", {}).get(
-                "opendoor-address-book", []
-            )
+            doors = extract_controls_from_vip(self.vip_config)
 
             return {"doors": doors, "vip": self.vip_config}
 
@@ -69,8 +68,8 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Always close the connection after update
             await self.client.shutdown()
 
-    async def async_open_door(self, door_name: str) -> None:
-        """Open a specific door."""
+    async def async_open_door(self, control: dict[str, Any]) -> None:
+        """Open a specific door or relay control."""
         # Create a separate client instance for door operations
         # to avoid interfering with the coordinator's update cycle
         door_client = IconaBridgeClient(self.host)
@@ -84,15 +83,32 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             # Find the door
             doors = self.data.get("doors", [])
-            door = next((d for d in doors if d.get("name") == door_name), None)
+            door = next(
+                (
+                    d
+                    for d in doors
+                    if d.get("apt-address") == control.get("apt-address")
+                    and str(d.get("output-index"))
+                    == str(control.get("output-index"))
+                ),
+                None,
+            )
             if not door:
-                raise Exception(f"Door '{door_name}' not found")
+                raise Exception(
+                    "Control "
+                    f"{control.get('apt-address')}#{control.get('output-index')} not found"
+                )
 
             # Open the door
             await door_client.open_door(self.vip_config, door)
 
         except Exception as err:
-            _LOGGER.error("Error opening door %s: %s", door_name, err)
+            _LOGGER.error(
+                "Error opening control %s#%s: %s",
+                control.get("apt-address"),
+                control.get("output-index"),
+                err,
+            )
             raise
         finally:
             # Always clean up the door client connection

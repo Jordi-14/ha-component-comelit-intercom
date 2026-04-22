@@ -1,13 +1,13 @@
 # Comelit Intercom for Home Assistant
 
-This is a native Home Assistant integration for Comelit intercom systems (using the ICONA Bridge protocol). It allows you to control your Comelit doors directly from Home Assistant without requiring MQTT or Docker containers.
+This is a native Home Assistant integration for Comelit intercom systems (using the ICONA Bridge protocol). It allows you to control your Comelit doors and compatible relay outputs directly from Home Assistant without requiring MQTT or Docker containers.
 
 ## Features
 
 - Direct TCP communication with Comelit intercom devices (no MQTT bridge needed)
 - **Automatic token extraction** - no manual token retrieval required (if using default password)
-- Automatic discovery of all available doors
-- Creates button entities for each door
+- Automatic discovery of all available doors and compatible relay/actuator controls
+- Creates button entities for each door and compatible relay/actuator control
 - Simple configuration through Home Assistant UI
 - Works with Comelit intercom models that support the ICONA Bridge protocol
 
@@ -63,8 +63,8 @@ https://github.com/madchicken/comelit-client/wiki/Get-your-user-token-for-ICONA-
 After configuration, the integration will:
 1. Connect to your Comelit device
 2. Authenticate using your token
-3. Discover all available doors
-4. Create a button entity for each door (e.g., `button.comelit_front_door_unlatch`)
+3. Discover all available doors and compatible relay/actuator controls
+4. Create a button entity for each discovered control (e.g., `button.comelit_front_door_unlatch`)
 
 You can then:
 - Add door buttons to your dashboard
@@ -163,9 +163,9 @@ This integration was made possible thanks to:
 - Device might have been reset
 - Try the automatic extraction again
 
-### Doors Not Appearing
+### Controls Not Appearing
 - Check that doors are configured in your Comelit mobile app first
-- Verify the device config contains door entries
+- Verify the device config contains door or actuator entries
 - Try using the test service to debug: Developer Tools → Services → comelit_intercom.test_connection
 - Check logs for configuration data
 
