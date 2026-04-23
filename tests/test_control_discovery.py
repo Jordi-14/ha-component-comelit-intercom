@@ -19,13 +19,16 @@ assert SPEC.loader is not None
 CONTROL_DISCOVERY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CONTROL_DISCOVERY)
 
+CONTROL_TYPE_ACTUATOR = CONTROL_DISCOVERY.CONTROL_TYPE_ACTUATOR
+CONTROL_TYPE_OPENDOOR = CONTROL_DISCOVERY.CONTROL_TYPE_OPENDOOR
+control_identity = CONTROL_DISCOVERY.control_identity
 extract_controls_from_vip = CONTROL_DISCOVERY.extract_controls_from_vip
 
 
 class ExtractControlsFromVipTests(unittest.TestCase):
-    """Verify that controls are discovered from multiple address books."""
+    """Verify that controls are discovered from the expected address books."""
 
-    def test_merges_actuator_rows_split_across_multiple_lists(self) -> None:
+    def test_preserves_actuator_metadata(self) -> None:
         vip_config = {
             "user-parameters": {
                 "opendoor-address-book": [
@@ -39,12 +42,16 @@ class ExtractControlsFromVipTests(unittest.TestCase):
                     {
                         "name": "Secondary relay",
                         "apt-address": "SBIO0255",
+                        "module-index": 255,
+                        "output-index": 1,
                     }
                 ],
-                "additional-actuator-address-book": [
+                "additional-actuator": [
                     {
+                        "enabled": True,
                         "apt-address": "SBIO0255",
-                        "output-index": 255,
+                        "module-index": 255,
+                        "output-index": 1,
                     }
                 ],
             }
@@ -55,53 +62,27 @@ class ExtractControlsFromVipTests(unittest.TestCase):
         self.assertEqual(len(controls), 2)
         self.assertIn(
             {
+                "control-type": CONTROL_TYPE_OPENDOOR,
                 "name": "Entrance lock",
                 "apt-address": "SB100001",
                 "output-index": 1,
+                "secure-mode": False,
             },
             controls,
         )
         self.assertIn(
             {
+                "control-type": CONTROL_TYPE_ACTUATOR,
                 "name": "Secondary relay",
                 "apt-address": "SBIO0255",
-                "output-index": 255,
+                "module-index": 255,
+                "output-index": 1,
+                "enabled": True,
             },
             controls,
         )
 
-    def test_deduplicates_controls_with_same_address_and_output(self) -> None:
-        vip_config = {
-            "user-parameters": {
-                "opendoor-address-book": [
-                    {
-                        "name": "Entrance lock",
-                        "apt-address": "SB100001",
-                        "output-index": 1,
-                    }
-                ],
-                "actuator-address-book": [
-                    {
-                        "name": "Secondary relay",
-                        "apt-address": "SBIO0255",
-                        "output-index": 255,
-                    }
-                ],
-                "additional-actuator-address-book": [
-                    {
-                        "name": "Secondary relay",
-                        "apt-address": "SBIO0255",
-                        "output-index": 255,
-                    }
-                ],
-            }
-        }
-
-        controls = extract_controls_from_vip(vip_config)
-
-        self.assertEqual(len(controls), 2)
-
-    def test_falls_back_to_actuator_address_suffix_for_output_index(self) -> None:
+    def test_merges_additional_actuator_data_when_primary_entry_is_incomplete(self) -> None:
         vip_config = {
             "user-parameters": {
                 "actuator-address-book": [
@@ -109,7 +90,15 @@ class ExtractControlsFromVipTests(unittest.TestCase):
                         "name": "Garage relay",
                         "apt-address": "SBIO0255",
                     }
-                ]
+                ],
+                "additional-actuator": [
+                    {
+                        "enabled": True,
+                        "apt-address": "SBIO0255",
+                        "module-index": 255,
+                        "output-index": 1,
+                    }
+                ],
             }
         }
 
@@ -119,12 +108,32 @@ class ExtractControlsFromVipTests(unittest.TestCase):
             controls,
             [
                 {
+                    "control-type": CONTROL_TYPE_ACTUATOR,
                     "name": "Garage relay",
                     "apt-address": "SBIO0255",
-                    "output-index": 255,
+                    "module-index": 255,
+                    "output-index": 1,
+                    "enabled": True,
                 }
             ],
         )
+
+    def test_control_identity_distinguishes_door_and_actuator_entries(self) -> None:
+        door = {
+            "control-type": CONTROL_TYPE_OPENDOOR,
+            "name": "Entrance lock",
+            "apt-address": "SB100001",
+            "output-index": 1,
+        }
+        actuator = {
+            "control-type": CONTROL_TYPE_ACTUATOR,
+            "name": "Entrance lock",
+            "apt-address": "SB100001",
+            "output-index": 1,
+            "module-index": 255,
+        }
+
+        self.assertNotEqual(control_identity(door), control_identity(actuator))
 
 
 if __name__ == "__main__":

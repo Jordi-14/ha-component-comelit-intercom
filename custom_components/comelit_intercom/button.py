@@ -13,6 +13,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
+from .control_discovery import control_identity
 from .coordinator import ComelitDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -53,7 +54,11 @@ class ComelitDoorButton(CoordinatorEntity[ComelitDataUpdateCoordinator], ButtonE
         self._attr_name = door.get("name", "Unknown Door")
 
         # Create unique ID based on host and door details
-        door_id = f"{door.get('apt-address', '')}_{door.get('output-index', '')}"
+        control_type, apt_address, output_index, module_index = control_identity(door)
+        module_suffix = (
+            f"_{module_index}" if module_index is not None else ""
+        )
+        door_id = f"{control_type}_{apt_address}_{output_index}{module_suffix}"
         self._attr_unique_id = f"{coordinator.entry.unique_id}_{door_id}"
 
         # Set device info
@@ -66,13 +71,12 @@ class ComelitDoorButton(CoordinatorEntity[ComelitDataUpdateCoordinator], ButtonE
 
     async def async_press(self) -> None:
         """Handle the button press."""
-        await self.coordinator.async_open_door(self._door)
+        await self.coordinator.async_open_control(self._door)
 
     @property
     def available(self) -> bool:
         """Return if entity is available."""
         return self.coordinator.last_update_success and any(
-            d.get("apt-address") == self._door.get("apt-address")
-            and str(d.get("output-index")) == str(self._door.get("output-index"))
+            control_identity(d) == control_identity(self._door)
             for d in self.coordinator.data.get("doors", [])
         )

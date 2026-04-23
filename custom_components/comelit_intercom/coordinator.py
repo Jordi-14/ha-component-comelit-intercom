@@ -13,7 +13,11 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .comelit_client import IconaBridgeClient
 from .const import CONF_HOST, CONF_TOKEN, DOMAIN, UPDATE_INTERVAL
-from .control_discovery import extract_controls_from_vip
+from .control_discovery import (
+    CONTROL_TYPE_ACTUATOR,
+    control_identity,
+    extract_controls_from_vip,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -68,8 +72,8 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Always close the connection after update
             await self.client.shutdown()
 
-    async def async_open_door(self, control: dict[str, Any]) -> None:
-        """Open a specific door or relay control."""
+    async def async_open_control(self, control: dict[str, Any]) -> None:
+        """Open a specific door or actuator control."""
         # Create a separate client instance for door operations
         # to avoid interfering with the coordinator's update cycle
         door_client = IconaBridgeClient(self.host)
@@ -81,30 +85,28 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if auth_code != 200:
                 raise Exception(f"Authentication failed with code {auth_code}")
 
-            # Find the door
-            doors = self.data.get("doors", [])
-            door = next(
-                (
-                    d
-                    for d in doors
-                    if d.get("apt-address") == control.get("apt-address")
-                    and str(d.get("output-index"))
-                    == str(control.get("output-index"))
-                ),
+            # Find the latest copy of the control from the coordinator data
+            controls = self.data.get("doors", [])
+            matched_control = next(
+                (item for item in controls if control_identity(item) == control_identity(control)),
                 None,
             )
-            if not door:
+            if not matched_control:
                 raise Exception(
                     "Control "
+                    f"{control.get('control-type')} "
                     f"{control.get('apt-address')}#{control.get('output-index')} not found"
                 )
 
-            # Open the door
-            await door_client.open_door(self.vip_config, door)
+            if matched_control.get("control-type") == CONTROL_TYPE_ACTUATOR:
+                await door_client.open_actuator(self.vip_config, matched_control)
+            else:
+                await door_client.open_door(self.vip_config, matched_control)
 
         except Exception as err:
             _LOGGER.error(
-                "Error opening control %s#%s: %s",
+                "Error opening %s control %s#%s: %s",
+                control.get("control-type"),
                 control.get("apt-address"),
                 control.get("output-index"),
                 err,

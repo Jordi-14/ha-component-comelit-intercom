@@ -1,160 +1,148 @@
-"""Helpers for discovering door and relay controls from VIP configuration."""
+"""Helpers for discovering Comelit door and actuator controls."""
 
 from __future__ import annotations
 
-import re
+from collections import defaultdict
 from typing import Any
+
+CONTROL_TYPE_OPENDOOR = "opendoor"
+CONTROL_TYPE_ACTUATOR = "actuator"
 
 
 def extract_controls_from_vip(vip_config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Extract door and compatible actuator controls from VIP configuration."""
+    """Extract Home Assistant controls from the VIP configuration."""
     user_parameters = vip_config.get("user-parameters", {})
     if not isinstance(user_parameters, dict):
         return []
 
     controls: list[dict[str, Any]] = []
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[str, str, int, int | None]] = set()
 
-    controls.extend(
-        _normalize_entries(
-            user_parameters.get("opendoor-address-book", []),
-            seen=seen,
-            fallback_prefix="Door",
-            source_key="opendoor-address-book",
-        )
+    for control in _normalize_opendoor_entries(
+        user_parameters.get("opendoor-address-book", [])
+    ):
+        _add_control(controls, seen, control)
+
+    for control in _normalize_actuator_entries(
+        user_parameters.get("actuator-address-book", []),
+        user_parameters.get("additional-actuator", []),
+    ):
+        _add_control(controls, seen, control)
+
+    return controls
+
+
+def control_identity(control: dict[str, Any]) -> tuple[str, str, int, int | None]:
+    """Return a stable identity for a discovered control."""
+    return (
+        str(control.get("control-type", CONTROL_TYPE_OPENDOOR)),
+        str(control.get("apt-address", "")),
+        int(control.get("output-index", -1)),
+        _coerce_int(control.get("module-index")),
     )
 
-    actuator_lists = [
-        (key, value)
-        for key, value in user_parameters.items()
-        if key != "opendoor-address-book"
-        and "actuator" in key
-        and isinstance(value, list)
-    ]
-    if not actuator_lists:
-        return controls
 
-    controls.extend(_normalize_merged_actuator_entries(actuator_lists, seen))
-
-    # Some firmware versions may already expose complete actuator rows in a single
-    # list, while others split the name and output index across multiple lists.
-    # Normalizing the original rows after the merge lets us support both layouts.
-    for key, entries in actuator_lists:
-        controls.extend(
-            _normalize_entries(
-                entries,
-                seen=seen,
-                fallback_prefix="Actuator",
-                source_key=key,
-            )
-        )
-
-    return controls
-
-
-def _normalize_merged_actuator_entries(
-    actuator_lists: list[tuple[str, list[Any]]],
-    seen: set[tuple[str, int]],
-) -> list[dict[str, Any]]:
-    """Merge actuator rows by index and normalize the resulting controls."""
-    controls: list[dict[str, Any]] = []
-    max_len = max((len(entries) for _key, entries in actuator_lists), default=0)
-
-    for index in range(max_len):
-        merged: dict[str, Any] = {}
-        source_keys: list[str] = []
-
-        for key, entries in actuator_lists:
-            if index >= len(entries) or not isinstance(entries[index], dict):
-                continue
-
-            _merge_non_empty(merged, entries[index])
-            source_keys.append(key)
-
-        if not merged:
-            continue
-
-        control = _normalize_entry(
-            merged,
-            fallback_name=f"Actuator {index + 1}",
-            source_key=",".join(source_keys),
-        )
-        if control is None:
-            continue
-
-        identity = (control["apt-address"], control["output-index"])
-        if identity in seen:
-            continue
-
-        seen.add(identity)
-        controls.append(control)
-
-    return controls
-
-
-def _normalize_entries(
-    entries: Any,
-    *,
-    seen: set[tuple[str, int]],
-    fallback_prefix: str,
-    source_key: str,
-) -> list[dict[str, Any]]:
-    """Normalize a list of control entries."""
+def _normalize_opendoor_entries(entries: Any) -> list[dict[str, Any]]:
+    """Normalize standard open-door entries."""
     if not isinstance(entries, list):
         return []
 
     controls: list[dict[str, Any]] = []
-
     for index, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict):
             continue
 
-        control = _normalize_entry(
-            entry,
-            fallback_name=f"{fallback_prefix} {index}",
-            source_key=source_key,
+        apt_address = _first_string(entry, "apt-address")
+        output_index = _coerce_int(entry.get("output-index"))
+        if apt_address is None or output_index is None:
+            continue
+
+        controls.append(
+            {
+                "control-type": CONTROL_TYPE_OPENDOOR,
+                "name": _first_string(entry, "name") or f"Door {index}",
+                "apt-address": apt_address,
+                "output-index": output_index,
+                "secure-mode": bool(entry.get("secure-mode", False)),
+            }
         )
-        if control is None:
+
+    return controls
+
+
+def _normalize_actuator_entries(
+    actuator_entries: Any,
+    additional_entries: Any,
+) -> list[dict[str, Any]]:
+    """Normalize actuator entries using the same data model as comelit-client."""
+    if not isinstance(actuator_entries, list):
+        return []
+
+    supplemental_by_index = [
+        entry if isinstance(entry, dict) else {}
+        for entry in (additional_entries if isinstance(additional_entries, list) else [])
+    ]
+    supplemental_by_address: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for entry in supplemental_by_index:
+        apt_address = _first_string(entry, "apt-address")
+        if apt_address is not None:
+            supplemental_by_address[apt_address].append(entry)
+
+    controls: list[dict[str, Any]] = []
+    for index, entry in enumerate(actuator_entries, start=1):
+        if not isinstance(entry, dict):
             continue
 
-        identity = (control["apt-address"], control["output-index"])
-        if identity in seen:
+        merged: dict[str, Any] = {}
+        if index - 1 < len(supplemental_by_index):
+            _merge_non_empty(merged, supplemental_by_index[index - 1])
+
+        _merge_non_empty(merged, entry)
+
+        apt_address = _first_string(merged, "apt-address")
+        if apt_address is None:
             continue
 
-        seen.add(identity)
+        if "output-index" not in merged or "module-index" not in merged:
+            candidates = supplemental_by_address.get(apt_address, [])
+            if len(candidates) == 1:
+                _merge_non_empty(merged, candidates[0])
+
+        output_index = _coerce_int(merged.get("output-index"))
+        if output_index is None:
+            continue
+
+        control = {
+            "control-type": CONTROL_TYPE_ACTUATOR,
+            "name": _first_string(merged, "name") or f"Actuator {index}",
+            "apt-address": apt_address,
+            "output-index": output_index,
+        }
+
+        module_index = _coerce_int(merged.get("module-index"))
+        if module_index is not None:
+            control["module-index"] = module_index
+
+        if "enabled" in merged:
+            control["enabled"] = bool(merged["enabled"])
+
         controls.append(control)
 
     return controls
 
 
-def _normalize_entry(
-    entry: dict[str, Any],
-    *,
-    fallback_name: str,
-    source_key: str,
-) -> dict[str, Any] | None:
-    """Normalize a single control entry into the format used by the client."""
-    apt_address = _first_string(
-        entry,
-        "apt-address",
-        "address",
-        "logical-address",
-        "device-address",
-    )
-    if apt_address is None:
-        return None
+def _add_control(
+    controls: list[dict[str, Any]],
+    seen: set[tuple[str, str, int, int | None]],
+    control: dict[str, Any],
+) -> None:
+    """Append a control if its identity has not already been seen."""
+    identity = control_identity(control)
+    if identity in seen:
+        return
 
-    output_index = _extract_output_index(entry)
-    if output_index is None and "actuator" in source_key:
-        output_index = _extract_index_from_address(apt_address)
-    if output_index is None:
-        return None
-
-    return {
-        "name": _first_string(entry, "name", "description", "label") or fallback_name,
-        "apt-address": apt_address,
-        "output-index": output_index,
-    }
+    seen.add(identity)
+    controls.append(control)
 
 
 def _first_string(entry: dict[str, Any], *keys: str) -> str | None:
@@ -164,23 +152,6 @@ def _first_string(entry: dict[str, Any], *keys: str) -> str | None:
         if isinstance(value, str) and value:
             return value
     return None
-
-
-def _extract_output_index(entry: dict[str, Any]) -> int | None:
-    """Extract an output index from a control entry."""
-    for key in ("output-index", "output", "actuator-index", "relay-index", "index"):
-        if key in entry:
-            return _coerce_int(entry.get(key))
-    return None
-
-
-def _extract_index_from_address(apt_address: str) -> int | None:
-    """Best-effort fallback for actuator addresses like ``SBIO0255``."""
-    match = re.search(r"(\d+)$", apt_address)
-    if match is None:
-        return None
-
-    return _coerce_int(match.group(1))
 
 
 def _coerce_int(value: Any) -> int | None:
@@ -202,5 +173,4 @@ def _merge_non_empty(target: dict[str, Any], source: dict[str, Any]) -> None:
     for key, value in source.items():
         if value in (None, "", [], {}):
             continue
-        if key not in target or target[key] in (None, "", [], {}):
-            target[key] = value
+        target[key] = value

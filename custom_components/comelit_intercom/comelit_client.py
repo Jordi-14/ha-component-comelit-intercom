@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
-from .control_discovery import extract_controls_from_vip
+from .control_discovery import CONTROL_TYPE_ACTUATOR, extract_controls_from_vip
 
 # Protocol Constants
 ICONA_BRIDGE_PORT = 64100  # TCP port for ICONA Bridge protocol
@@ -533,6 +533,53 @@ class IconaBridgeClient:
         # and the device may not send acknowledgments
         self.logger.info(f"Door '{door_item.get('name', 'Unknown')}' open command sent")
 
+    async def open_actuator(self, vip: dict, actuator_item: dict):
+        """Open a specific actuator using the actuator packet flow."""
+        if Channel.CTPP not in self.open_channels:
+            await self._open_door_init(vip)
+
+        channel = self.open_channels[Channel.CTPP]
+        output_index = int(actuator_item["output-index"])
+
+        init_buffers = [
+            bytes([0xC0, 0x18, 0x45, 0xBE]),
+            bytes([0x8F, 0x5C, 0x00, 0x04]),
+            bytes([0x00, 0x20, 0xFF, 0x01]),
+            bytes([0xFF, 0xFF, 0xFF, 0xFF]),
+            self._string_to_buffer(f"{vip['apt-address']}{output_index}", True),
+            self._string_to_buffer(actuator_item["apt-address"], True),
+            NULL,
+        ]
+        packet = self._create_binary_packet_from_buffers(channel.id, *init_buffers)
+        await self._write_packet(packet)
+
+        try:
+            await asyncio.wait_for(self._read_response(), timeout=2.0)
+            await asyncio.wait_for(self._read_response(), timeout=2.0)
+        except TimeoutError:
+            self.logger.warning(
+                "Timeout waiting for actuator init responses - continuing anyway"
+            )
+
+        def create_actuator_message(confirm: bool = False) -> bytes:
+            first_byte = 0x20 if confirm else 0x00
+            buffers = [
+                bytes([first_byte, 0x18, 0x45, 0xBE]),
+                bytes([0x8F, 0x5C, 0x00, 0x04]),
+                bytes([0xFF, 0xFF, 0xFF, 0xFF]),
+                self._string_to_buffer(f"{vip['apt-address']}{output_index}", True),
+                self._string_to_buffer(actuator_item["apt-address"], True),
+                NULL,
+            ]
+            return self._create_binary_packet_from_buffers(channel.id, *buffers)
+
+        await self._write_packet(create_actuator_message(False))
+        await self._write_packet(create_actuator_message(True))
+
+        self.logger.info(
+            "Actuator '%s' open command sent", actuator_item.get("name", "Unknown")
+        )
+
 
 # High-level convenience functions
 async def list_doors(host: str, token: str) -> list[dict[str, Any]]:
@@ -566,16 +613,18 @@ async def open_door(host: str, token: str, door_name: str) -> bool:
         vip = config["vip"]
         doors = extract_controls_from_vip(vip)
 
-        # Find the door by name
-        door = next((d for d in doors if d.get("name") == door_name), None)
-        if not door:
+        # Find the control by name
+        control = next((d for d in doors if d.get("name") == door_name), None)
+        if not control:
             available = [d.get("name", "Unknown") for d in doors]
             raise Exception(
                 f"Door '{door_name}' not found. Available: {', '.join(available)}"
             )
 
-        # Open the door
-        await client.open_door(vip, door)
+        if control.get("control-type") == CONTROL_TYPE_ACTUATOR:
+            await client.open_actuator(vip, control)
+        else:
+            await client.open_door(vip, control)
         return True
 
     finally:
