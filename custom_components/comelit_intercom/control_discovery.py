@@ -94,19 +94,20 @@ def _normalize_actuator_entries(
             continue
 
         merged: dict[str, Any] = {}
-        if index - 1 < len(supplemental_by_index):
-            _merge_non_empty(merged, supplemental_by_index[index - 1])
-
         _merge_non_empty(merged, entry)
 
         apt_address = _first_string(merged, "apt-address")
         if apt_address is None:
             continue
 
-        if "output-index" not in merged or "module-index" not in merged:
-            candidates = supplemental_by_address.get(apt_address, [])
-            if len(candidates) == 1:
-                _merge_non_empty(merged, candidates[0])
+        supplemental = _find_matching_additional_actuator(
+            entry,
+            apt_address,
+            supplemental_by_index[index - 1] if index - 1 < len(supplemental_by_index) else None,
+            supplemental_by_address,
+        )
+        if supplemental is not None:
+            _merge_non_empty(merged, supplemental)
 
         output_index = _coerce_int(merged.get("output-index"))
         if output_index is None:
@@ -129,6 +130,51 @@ def _normalize_actuator_entries(
         controls.append(control)
 
     return controls
+
+
+def _find_matching_additional_actuator(
+    actuator_entry: dict[str, Any],
+    apt_address: str,
+    indexed_entry: dict[str, Any] | None,
+    supplemental_by_address: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any] | None:
+    """Select the supplemental actuator entry that belongs to this actuator."""
+    if indexed_entry is not None and _additional_actuator_matches(
+        actuator_entry, apt_address, indexed_entry
+    ):
+        return indexed_entry
+
+    candidates = [
+        entry
+        for entry in supplemental_by_address.get(apt_address, [])
+        if _additional_actuator_matches(actuator_entry, apt_address, entry)
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+
+    return None
+
+
+def _additional_actuator_matches(
+    actuator_entry: dict[str, Any],
+    apt_address: str,
+    supplemental_entry: dict[str, Any],
+) -> bool:
+    """Return whether a supplemental actuator entry is compatible."""
+    if _first_string(supplemental_entry, "apt-address") != apt_address:
+        return False
+
+    for key in ("output-index", "module-index"):
+        actuator_value = _coerce_int(actuator_entry.get(key))
+        supplemental_value = _coerce_int(supplemental_entry.get(key))
+        if (
+            actuator_value is not None
+            and supplemental_value is not None
+            and actuator_value != supplemental_value
+        ):
+            return False
+
+    return True
 
 
 def _add_control(

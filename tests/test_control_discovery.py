@@ -118,6 +118,60 @@ class ExtractControlsFromVipTests(unittest.TestCase):
             ],
         )
 
+    def test_matches_additional_actuators_by_address_when_lists_are_misaligned(self) -> None:
+        vip_config = {
+            "user-parameters": {
+                "actuator-address-book": [
+                    {
+                        "name": "Garage relay",
+                        "apt-address": "SBIO0255",
+                    },
+                    {
+                        "name": "Gate relay",
+                        "apt-address": "SBIO0256",
+                    },
+                ],
+                "additional-actuator": [
+                    {
+                        "enabled": True,
+                        "apt-address": "SBIO0256",
+                        "module-index": 256,
+                        "output-index": 2,
+                    },
+                    {
+                        "enabled": True,
+                        "apt-address": "SBIO0255",
+                        "module-index": 255,
+                        "output-index": 1,
+                    },
+                ],
+            }
+        }
+
+        controls = extract_controls_from_vip(vip_config)
+
+        self.assertEqual(
+            controls,
+            [
+                {
+                    "control-type": CONTROL_TYPE_ACTUATOR,
+                    "name": "Garage relay",
+                    "apt-address": "SBIO0255",
+                    "module-index": 255,
+                    "output-index": 1,
+                    "enabled": True,
+                },
+                {
+                    "control-type": CONTROL_TYPE_ACTUATOR,
+                    "name": "Gate relay",
+                    "apt-address": "SBIO0256",
+                    "module-index": 256,
+                    "output-index": 2,
+                    "enabled": True,
+                },
+            ],
+        )
+
     def test_control_identity_distinguishes_door_and_actuator_entries(self) -> None:
         door = {
             "control-type": CONTROL_TYPE_OPENDOOR,
