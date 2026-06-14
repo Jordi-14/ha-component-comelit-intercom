@@ -80,7 +80,9 @@ def _normalize_actuator_entries(
 
     supplemental_by_index = [
         entry if isinstance(entry, dict) else {}
-        for entry in (additional_entries if isinstance(additional_entries, list) else [])
+        for entry in (
+            additional_entries if isinstance(additional_entries, list) else []
+        )
     ]
     supplemental_by_address: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for entry in supplemental_by_index:
@@ -103,7 +105,11 @@ def _normalize_actuator_entries(
         supplemental = _find_matching_additional_actuator(
             entry,
             apt_address,
-            supplemental_by_index[index - 1] if index - 1 < len(supplemental_by_index) else None,
+            (
+                supplemental_by_index[index - 1]
+                if index - 1 < len(supplemental_by_index)
+                else None
+            ),
             supplemental_by_address,
         )
         if supplemental is not None:

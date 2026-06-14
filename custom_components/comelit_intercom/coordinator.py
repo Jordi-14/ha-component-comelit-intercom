@@ -8,7 +8,7 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .comelit_client import IconaBridgeClient
@@ -83,16 +83,22 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Authenticate
             auth_code = await door_client.authenticate(self.token)
             if auth_code != 200:
-                raise Exception(f"Authentication failed with code {auth_code}")
+                raise HomeAssistantError(
+                    f"Comelit authentication failed with code {auth_code}"
+                )
 
             # Find the latest copy of the control from the coordinator data
-            controls = self.data.get("doors", [])
+            controls = (self.data or {}).get("doors", [])
             matched_control = next(
-                (item for item in controls if control_identity(item) == control_identity(control)),
+                (
+                    item
+                    for item in controls
+                    if control_identity(item) == control_identity(control)
+                ),
                 None,
             )
             if not matched_control:
-                raise Exception(
+                raise HomeAssistantError(
                     "Control "
                     f"{control.get('control-type')} "
                     f"{control.get('apt-address')}#{control.get('output-index')} not found"
@@ -103,15 +109,16 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else:
                 await door_client.open_door(self.vip_config, matched_control)
 
-        except Exception as err:
-            _LOGGER.error(
-                "Error opening %s control %s#%s: %s",
-                control.get("control-type"),
-                control.get("apt-address"),
-                control.get("output-index"),
-                err,
-            )
+        except HomeAssistantError:
             raise
+        except Exception as err:
+            message = (
+                "Failed to open "
+                f"{control.get('control-type')} control "
+                f"{control.get('apt-address')}#{control.get('output-index')}: {err}"
+            )
+            _LOGGER.error("%s", message)
+            raise HomeAssistantError(message) from err
         finally:
             # Always clean up the door client connection
             await door_client.shutdown()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import voluptuous as vol
 from homeassistant import config_entries
@@ -16,6 +16,11 @@ from homeassistant.exceptions import HomeAssistantError
 from .comelit_client import IconaBridgeClient
 from .const import DOMAIN
 from .token_extractor import extract_token
+
+if TYPE_CHECKING:
+    from homeassistant.config_entries import ConfigFlowResult
+else:
+    ConfigFlowResult = FlowResult
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -66,31 +71,36 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     client = IconaBridgeClient(data[CONF_HOST])
 
     try:
-        # Add timeout to prevent hanging
-        _LOGGER.info("Attempting to connect to Comelit device at %s", data[CONF_HOST])
-        await asyncio.wait_for(client.connect(), timeout=10.0)
-        _LOGGER.info("Successfully connected to device")
-    except TimeoutError as e:
-        _LOGGER.error("Connection timeout to device at %s", data[CONF_HOST])
-        raise CannotConnect("Connection timeout - device not responding") from e
-    except OSError as err:
-        # Special handling for macOS "No route to host" error
-        if err.errno == 65:  # EHOSTUNREACH on macOS
-            _LOGGER.error(
-                "Cannot reach device at %s:%s - possible firewall or wrong port",
-                data[CONF_HOST],
-                64100,
+        try:
+            # Add timeout to prevent hanging
+            _LOGGER.info(
+                "Attempting to connect to Comelit device at %s", data[CONF_HOST]
             )
-            raise CannotConnect(
-                "Cannot reach device - check firewall settings"
-            ) from err
-        _LOGGER.error("Network error connecting to device: %s", err)
-        raise CannotConnect(f"Network error: {err}") from err
-    except Exception as err:
-        _LOGGER.error("Cannot connect to device: %s", err)
-        raise CannotConnect from err
+            await asyncio.wait_for(client.connect(), timeout=10.0)
+            _LOGGER.info("Successfully connected to device")
+        except TimeoutError as e:
+            _LOGGER.error("Connection timeout to device at %s", data[CONF_HOST])
+            raise CannotConnect("Connection timeout - device not responding") from e
+        except ConnectionError as err:
+            _LOGGER.error("Cannot connect to device: %s", err)
+            raise CannotConnect(str(err)) from err
+        except OSError as err:
+            # Special handling for macOS "No route to host" error
+            if err.errno == 65:  # EHOSTUNREACH on macOS
+                _LOGGER.error(
+                    "Cannot reach device at %s:%s - possible firewall or wrong port",
+                    data[CONF_HOST],
+                    64100,
+                )
+                raise CannotConnect(
+                    "Cannot reach device - check firewall settings"
+                ) from err
+            _LOGGER.error("Network error connecting to device: %s", err)
+            raise CannotConnect(f"Network error: {err}") from err
+        except Exception as err:
+            _LOGGER.error("Cannot connect to device: %s", err)
+            raise CannotConnect from err
 
-    try:
         _LOGGER.info("Authenticating with device")
         auth_code = await asyncio.wait_for(
             client.authenticate(data[CONF_TOKEN]), timeout=15.0
@@ -109,7 +119,6 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
             raise CannotConnect("Failed to get configuration")
 
         _LOGGER.info("Configuration retrieved successfully")
-        await client.shutdown()
 
         # Return info that you want to store in the config entry
         return {
@@ -120,18 +129,16 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     except TimeoutError as err:
         _LOGGER.error("Operation timeout while communicating with device: %s", err)
         _LOGGER.error("This could be during connect, auth, or config retrieval")
-        await client.shutdown()
         raise CannotConnect("Device communication timeout") from err
     except InvalidAuth:
-        await client.shutdown()
         raise
     except CannotConnect:
-        await client.shutdown()
         raise
     except Exception as err:
         _LOGGER.exception("Unexpected error during validation: %s", err)
-        await client.shutdown()
         raise CannotConnect(f"Unexpected error: {err}") from err
+    finally:
+        await client.shutdown()
 
 
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -141,7 +148,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         if user_input is None:
             return self.async_show_form(

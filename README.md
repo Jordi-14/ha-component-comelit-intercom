@@ -127,7 +127,6 @@ The integration consists of:
 - **config_flow.py**: UI configuration flow with automatic token extraction
 - **coordinator.py**: Data update coordinator for efficient polling
 - **button.py**: Button entities for door control
-- **test_service.py**: Developer service for testing connections
 
 ## Credits
 
@@ -166,7 +165,6 @@ This integration was made possible thanks to:
 ### Controls Not Appearing
 - Check that doors are configured in your Comelit mobile app first
 - Verify the device config contains door or actuator entries
-- Try using the test service to debug: Developer Tools → Services → comelit_intercom.test_connection
 - Check logs for configuration data
 
 ### Known Issues
@@ -175,18 +173,6 @@ This integration was made possible thanks to:
 - Very old firmware versions may use a different protocol
 
 ## Developer Information
-
-### Test Service
-
-The integration provides a `comelit_intercom.test_connection` service for debugging:
-```yaml
-service: comelit_intercom.test_connection
-data:
-  ip: "192.168.1.100"
-  token: "your_token_here"
-```
-
-This will test the connection and report available doors in the logs.
 
 ### Protocol Implementation
 

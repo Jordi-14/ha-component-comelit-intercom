@@ -11,7 +11,6 @@ from homeassistant.exceptions import ConfigEntryNotReady
 
 from .const import DOMAIN
 from .coordinator import ComelitDataUpdateCoordinator
-from .test_service import async_setup_test_service
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,11 +31,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-    # Set up test service (only once)
-    if "test_service_setup" not in hass.data.get(DOMAIN, {}):
-        await async_setup_test_service(hass)
-        hass.data[DOMAIN]["test_service_setup"] = True
 
     return True
 

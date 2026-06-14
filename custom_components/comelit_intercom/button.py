@@ -29,7 +29,7 @@ async def async_setup_entry(
 
     # Create button entities for each door
     entities = []
-    doors = coordinator.data.get("doors", [])
+    doors = (coordinator.data or {}).get("doors", [])
 
     for door in doors:
         entities.append(ComelitDoorButton(coordinator, door))
@@ -54,16 +54,15 @@ class ComelitDoorButton(CoordinatorEntity[ComelitDataUpdateCoordinator], ButtonE
         self._attr_name = door.get("name", "Unknown Door")
 
         # Create unique ID based on host and door details
+        entry_unique_id = coordinator.entry.unique_id or coordinator.host
         control_type, apt_address, output_index, module_index = control_identity(door)
-        module_suffix = (
-            f"_{module_index}" if module_index is not None else ""
-        )
+        module_suffix = f"_{module_index}" if module_index is not None else ""
         door_id = f"{control_type}_{apt_address}_{output_index}{module_suffix}"
-        self._attr_unique_id = f"{coordinator.entry.unique_id}_{door_id}"
+        self._attr_unique_id = f"{entry_unique_id}_{door_id}"
 
         # Set device info
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, coordinator.entry.unique_id)},
+            identifiers={(DOMAIN, entry_unique_id)},
             name=f"Comelit Intercom ({coordinator.host})",
             manufacturer="Comelit",
             model="ICONA Bridge",
@@ -78,5 +77,5 @@ class ComelitDoorButton(CoordinatorEntity[ComelitDataUpdateCoordinator], ButtonE
         """Return if entity is available."""
         return self.coordinator.last_update_success and any(
             control_identity(d) == control_identity(self._door)
-            for d in self.coordinator.data.get("doors", [])
+            for d in (self.coordinator.data or {}).get("doors", [])
         )

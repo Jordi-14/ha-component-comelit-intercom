@@ -15,6 +15,88 @@ ICONA_BRIDGE_PORT = 64100  # TCP port for ICONA Bridge protocol
 HEADER_MAGIC = b"\x00\x06"  # All messages start with these magic bytes
 HEADER_SIZE = 8  # Fixed header size: magic(2) + length(2) + request_id(2) + padding(2)
 NULL = b"\x00"
+SENSITIVE_JSON_KEYS = frozenset({"user-token", "token", "password", "l-pwd"})
+SENSITIVE_PACKET_MARKERS = tuple(key.encode("utf-8") for key in SENSITIVE_JSON_KEYS)
+
+
+class ComelitClientError(Exception):
+    """Base exception for Comelit client errors."""
+
+
+class ComelitAuthenticationError(ComelitClientError):
+    """Raised when the device rejects authentication."""
+
+
+class ComelitProtocolError(ComelitClientError):
+    """Raised when the device protocol response is invalid or incomplete."""
+
+
+class ComelitControlNotFoundError(ComelitClientError):
+    """Raised when a requested control is not present in the device config."""
+
+
+def _json_has_sensitive_key(value: Any) -> bool:
+    """Return True if a decoded JSON value contains a sensitive key."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str) and key.lower() in SENSITIVE_JSON_KEYS:
+                return True
+            if _json_has_sensitive_key(item):
+                return True
+
+    if isinstance(value, list):
+        return any(_json_has_sensitive_key(item) for item in value)
+
+    return False
+
+
+def _bytes_contain_sensitive_marker(payload: bytes) -> bool:
+    """Return True if a byte payload contains a known sensitive marker."""
+    lowered = payload.lower()
+    return any(marker in lowered for marker in SENSITIVE_PACKET_MARKERS)
+
+
+def _body_contains_sensitive_payload(body: bytes) -> bool:
+    """Return True if a packet body should not be logged raw."""
+    if _bytes_contain_sensitive_marker(body):
+        return True
+
+    try:
+        decoded = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+
+    try:
+        data = json.loads(decoded)
+    except json.JSONDecodeError:
+        return False
+
+    return _json_has_sensitive_key(data) or (
+        isinstance(data, dict) and data.get("message") == "access"
+    )
+
+
+def _packet_body(packet: bytes) -> bytes:
+    """Return the body portion of a protocol packet."""
+    if len(packet) < HEADER_SIZE or packet[:2] != HEADER_MAGIC:
+        return packet
+
+    body_length = struct.unpack("<H", packet[2:4])[0]
+    return packet[HEADER_SIZE : HEADER_SIZE + body_length]
+
+
+def _packet_contains_sensitive_payload(packet: bytes) -> bool:
+    """Return True if a full packet should not be logged raw."""
+    return _bytes_contain_sensitive_marker(packet) or _body_contains_sensitive_payload(
+        _packet_body(packet)
+    )
+
+
+def _format_payload_for_debug(payload: bytes, sensitive: bool) -> str:
+    """Format a packet payload for debug logging."""
+    if sensitive:
+        return "<redacted sensitive payload>"
+    return payload.hex(" ")
 
 
 class MessageType(IntEnum):
@@ -66,7 +148,7 @@ class IconaBridgeClient:
         host: str,
         port: int = ICONA_BRIDGE_PORT,
         logger: logging.Logger | None = None,
-    ):
+    ) -> None:
         self.host = host
         self.port = port
         self.logger = logger or logging.getLogger(__name__)
@@ -77,7 +159,7 @@ class IconaBridgeClient:
         # The device tracks requests by ID, so we need unique values
         self.request_id = 8000 + int(asyncio.get_event_loop().time() * 10) % 1000
 
-    async def connect(self):
+    async def connect(self) -> None:
         """Connect to the ICONA Bridge"""
         self.logger.info(f"Connecting to {self.host}:{self.port}")
 
@@ -135,11 +217,19 @@ class IconaBridgeClient:
         except Exception:
             return False
 
-    async def shutdown(self):
+    async def shutdown(self) -> None:
         """Close the connection"""
-        if self.writer:
-            self.writer.close()
-            await self.writer.wait_closed()
+        writer = self.writer
+        self.reader = None
+        self.writer = None
+        self.open_channels.clear()
+
+        if writer:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (OSError, RuntimeError) as err:
+                self.logger.debug("Error while closing connection: %s", err)
             self.logger.info("Connection closed")
 
     def _create_header(self, body_length: int, request_id: int = 0) -> bytes:
@@ -160,7 +250,7 @@ class IconaBridgeClient:
         header[6:8] = b"\x00\x00"  # Required padding
         return bytes(header)
 
-    def _create_json_packet(self, request_id: int, data: dict) -> bytes:
+    def _create_json_packet(self, request_id: int, data: dict[str, Any]) -> bytes:
         """Create a JSON message packet"""
         json_str = json.dumps(data, separators=(",", ":"))
         json_bytes = json_str.encode("utf-8")
@@ -221,11 +311,21 @@ class IconaBridgeClient:
         )  # Request ID is 0 for command packets
         return header + body
 
-    async def _write_packet(self, packet: bytes):
+    async def _write_packet(self, packet: bytes) -> None:
         """Write a packet to the socket"""
-        self.logger.debug(f"Writing {len(packet)} bytes: {packet.hex(' ')}")
-        self.writer.write(packet)
-        await self.writer.drain()
+        writer = self.writer
+        if writer is None:
+            raise ConnectionError("Not connected to Comelit device")
+
+        self.logger.debug(
+            "Writing %s bytes: %s",
+            len(packet),
+            _format_payload_for_debug(
+                packet, _packet_contains_sensitive_payload(packet)
+            ),
+        )
+        writer.write(packet)
+        await writer.drain()
 
     async def _read_response(self) -> dict | None:
         """Read and parse a response from the socket
@@ -234,15 +334,23 @@ class IconaBridgeClient:
         - request_id == 0: Binary protocol messages (channel operations)
         - request_id > 0: JSON or binary data responses
         """
+        reader = self.reader
+        if reader is None:
+            raise ConnectionError("Not connected to Comelit device")
+
         # Read the 8-byte header first
-        header = await self.reader.readexactly(HEADER_SIZE)
+        header = await reader.readexactly(HEADER_SIZE)
         body_length = struct.unpack("<H", header[2:4])[0]
         request_id = struct.unpack("<H", header[4:6])[0]
 
         # Read body if present
         if body_length > 0:
-            body = await self.reader.readexactly(body_length)
-            self.logger.debug(f"Read {len(body)} bytes: {body.hex(' ')}")
+            body = await reader.readexactly(body_length)
+            self.logger.debug(
+                "Read %s bytes: %s",
+                len(body),
+                _format_payload_for_debug(body, _body_contains_sensitive_payload(body)),
+            )
 
             # Parse response based on request_id
             if request_id == 0:
@@ -318,7 +426,7 @@ class IconaBridgeClient:
             self.open_channels[channel] = channel_data
             return channel_data
         else:
-            raise Exception(f"Failed to open channel {channel}")
+            raise ComelitProtocolError(f"Failed to open channel {channel}")
 
     async def _close_channel(self, channel_data: ChannelData) -> bool:
         """Close a communication channel"""
@@ -330,10 +438,24 @@ class IconaBridgeClient:
 
         response = await self._read_response()
         if response and response["type"] == "binary":
-            del self.open_channels[channel_data.channel]
+            self.open_channels.pop(channel_data.channel, None)
             self.logger.debug(f"Closed channel {channel_data.channel}")
             return True
         return False
+
+    async def _close_channel_safely(self, channel_data: ChannelData) -> None:
+        """Close a channel without masking the original operation result."""
+        if channel_data.channel not in self.open_channels:
+            return
+
+        try:
+            await self._close_channel(channel_data)
+        except Exception as err:
+            self.logger.debug(
+                "Failed to close channel %s: %s", channel_data.channel, err
+            )
+        finally:
+            self.open_channels.pop(channel_data.channel, None)
 
     async def authenticate(self, token: str) -> int:
         """Authenticate with the ICONA Bridge
@@ -346,54 +468,59 @@ class IconaBridgeClient:
         # Open authentication channel
         channel = await self._open_channel(Channel.UAUT)
 
-        # Build authentication message
-        # The 'message-id' field must be numeric 2, not the string channel name
-        # This is a quirk of the protocol - different contexts use different ID types
-        auth_data = {
-            "message": "access",
-            "user-token": token,
-            "message-type": "request",
-            "message-id": 2,  # Must be 2, not ViperChannelType.UAUT
-        }
-        packet = self._create_json_packet(channel.id, auth_data)
-        await self._write_packet(packet)
+        try:
+            # Build authentication message
+            # The 'message-id' field must be numeric 2, not the string channel name
+            # This is a quirk of the protocol - different contexts use different ID types
+            auth_data = {
+                "message": "access",
+                "user-token": token,
+                "message-type": "request",
+                "message-id": 2,  # Must be 2, not ViperChannelType.UAUT
+            }
+            packet = self._create_json_packet(channel.id, auth_data)
+            await self._write_packet(packet)
 
-        # Read authentication response
-        response = await self._read_response()
-        if response and response["type"] == "json":
-            code = response["data"].get("response-code", 500)
-            await self._close_channel(channel)
-            return code
+            # Read authentication response
+            response = await self._read_response()
+            if response and response["type"] == "json":
+                data = response["data"]
+                if isinstance(data, dict):
+                    return int(data.get("response-code", 500))
 
-        # No valid response received
-        await self._close_channel(channel)
-        return 500
+            # No valid response received
+            return 500
+        finally:
+            await self._close_channel_safely(channel)
 
-    async def get_config(self, addressbooks: str = "all") -> dict | None:
+    async def get_config(self, addressbooks: str = "all") -> dict[str, Any] | None:
         """Get configuration from the device"""
         # Open config channel
         channel = await self._open_channel(Channel.UCFG)
 
-        # Send get-configuration message
-        config_data = {
-            "message": "get-configuration",
-            "addressbooks": addressbooks,
-            "message-type": "request",
-            "message-id": ViperChannelType.UCFG,
-        }
-        packet = self._create_json_packet(channel.id, config_data)
-        await self._write_packet(packet)
+        try:
+            # Send get-configuration message
+            config_data = {
+                "message": "get-configuration",
+                "addressbooks": addressbooks,
+                "message-type": "request",
+                "message-id": ViperChannelType.UCFG,
+            }
+            packet = self._create_json_packet(channel.id, config_data)
+            await self._write_packet(packet)
 
-        # Read response
-        response = await self._read_response()
-        if response and response["type"] == "json":
-            await self._close_channel(channel)
-            return response["data"]
+            # Read response
+            response = await self._read_response()
+            if response and response["type"] == "json":
+                data = response["data"]
+                if isinstance(data, dict):
+                    return data
 
-        await self._close_channel(channel)
-        return None
+            return None
+        finally:
+            await self._close_channel_safely(channel)
 
-    async def list_doors(self) -> list[dict]:
+    async def list_doors(self) -> list[dict[str, Any]]:
         """List all available doors and compatible relay controls."""
         config = await self.get_config("all")
         if config and "vip" in config:
@@ -407,7 +534,7 @@ class IconaBridgeClient:
             b += NULL
         return b
 
-    async def _open_door_init(self, vip: dict):
+    async def _open_door_init(self, vip: dict[str, Any]) -> None:
         """Initialize door opening sequence
 
         This establishes a control channel (CTPP) for the apartment.
@@ -447,7 +574,7 @@ class IconaBridgeClient:
                 "Timeout waiting for CTPP init responses - continuing anyway"
             )
 
-    async def open_door(self, vip: dict, door_item: dict):
+    async def open_door(self, vip: dict[str, Any], door_item: dict[str, Any]) -> None:
         """Open a specific door
 
         The door opening sequence involves multiple steps:
@@ -533,7 +660,9 @@ class IconaBridgeClient:
         # and the device may not send acknowledgments
         self.logger.info(f"Door '{door_item.get('name', 'Unknown')}' open command sent")
 
-    async def open_actuator(self, vip: dict, actuator_item: dict):
+    async def open_actuator(
+        self, vip: dict[str, Any], actuator_item: dict[str, Any]
+    ) -> None:
         """Open a specific actuator using the actuator packet flow."""
         if Channel.CTPP not in self.open_channels:
             await self._open_door_init(vip)
@@ -591,7 +720,9 @@ async def list_doors(host: str, token: str) -> list[dict[str, Any]]:
         if auth_code == 200:
             return await client.list_doors()
         else:
-            raise Exception(f"Authentication failed with code {auth_code}")
+            raise ComelitAuthenticationError(
+                f"Authentication failed with code {auth_code}"
+            )
     finally:
         await client.shutdown()
 
@@ -603,12 +734,14 @@ async def open_door(host: str, token: str, door_name: str) -> bool:
         await client.connect()
         auth_code = await client.authenticate(token)
         if auth_code != 200:
-            raise Exception(f"Authentication failed with code {auth_code}")
+            raise ComelitAuthenticationError(
+                f"Authentication failed with code {auth_code}"
+            )
 
         # Get configuration
         config = await client.get_config("all")
         if not config or "vip" not in config:
-            raise Exception("Failed to get configuration")
+            raise ComelitProtocolError("Failed to get configuration")
 
         vip = config["vip"]
         doors = extract_controls_from_vip(vip)
@@ -617,7 +750,7 @@ async def open_door(host: str, token: str, door_name: str) -> bool:
         control = next((d for d in doors if d.get("name") == door_name), None)
         if not control:
             available = [d.get("name", "Unknown") for d in doors]
-            raise Exception(
+            raise ComelitControlNotFoundError(
                 f"Door '{door_name}' not found. Available: {', '.join(available)}"
             )
 

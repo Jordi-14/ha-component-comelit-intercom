@@ -77,11 +77,6 @@ ruff check custom_components/comelit_intercom/
    - Handles button press events to open doors
    - Updates availability based on coordinator status
 
-6. **test_service.py** - Developer testing service
-   - Provides `comelit_intercom.test_connection` service
-   - Useful for debugging connectivity issues
-   - Logs discovered doors and connection status
-
 ### Protocol Details
 
 #### Binary Protocol Structure

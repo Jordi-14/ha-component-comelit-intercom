@@ -3,16 +3,13 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
 import sys
 import types
 import unittest
-
+from pathlib import Path
 
 MODULE_DIR = (
-    Path(__file__).resolve().parents[1]
-    / "custom_components"
-    / "comelit_intercom"
+    Path(__file__).resolve().parents[1] / "custom_components" / "comelit_intercom"
 )
 PACKAGE_ROOT = MODULE_DIR.parent
 TOP_LEVEL_PACKAGE = "custom_components"
@@ -89,6 +86,50 @@ class OpenActuatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn(b"SB0000011\x00", written_packets[0])
         self.assertIn(b"SBIO0255\x00", written_packets[0])
+
+
+class FakeWriter:
+    """Minimal stream writer for packet logging tests."""
+
+    def __init__(self) -> None:
+        self.written_packets: list[bytes] = []
+
+    def write(self, packet: bytes) -> None:
+        self.written_packets.append(packet)
+
+    async def drain(self) -> None:
+        return None
+
+
+class PacketLoggingTests(unittest.IsolatedAsyncioTestCase):
+    """Verify sensitive packets are never logged raw."""
+
+    async def test_write_packet_redacts_auth_payload(self) -> None:
+        client = IconaBridgeClient("192.0.2.1")
+        writer = FakeWriter()
+        client.writer = writer  # type: ignore[assignment]
+
+        token = "0123456789abcdef0123456789abcdef"
+        packet = client._create_json_packet(
+            1234,
+            {
+                "message": "access",
+                "user-token": token,
+                "message-type": "request",
+                "message-id": 2,
+            },
+        )
+
+        with self.assertLogs(COMELIT_CLIENT.__name__, level="DEBUG") as logs:
+            await client._write_packet(packet)
+
+        self.assertEqual(writer.written_packets, [packet])
+
+        log_output = "\n".join(logs.output)
+        self.assertIn("<redacted sensitive payload>", log_output)
+        self.assertNotIn(token, log_output)
+        self.assertNotIn(token.encode("utf-8").hex(" "), log_output)
+        self.assertNotIn(packet.hex(" "), log_output)
 
 
 if __name__ == "__main__":

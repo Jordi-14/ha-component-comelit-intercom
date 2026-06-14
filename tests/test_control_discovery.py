@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
 import unittest
-
+from pathlib import Path
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[1]
@@ -82,7 +81,9 @@ class ExtractControlsFromVipTests(unittest.TestCase):
             controls,
         )
 
-    def test_merges_additional_actuator_data_when_primary_entry_is_incomplete(self) -> None:
+    def test_merges_additional_actuator_data_when_primary_entry_is_incomplete(
+        self,
+    ) -> None:
         vip_config = {
             "user-parameters": {
                 "actuator-address-book": [
@@ -118,7 +119,9 @@ class ExtractControlsFromVipTests(unittest.TestCase):
             ],
         )
 
-    def test_matches_additional_actuators_by_address_when_lists_are_misaligned(self) -> None:
+    def test_matches_additional_actuators_by_address_when_lists_are_misaligned(
+        self,
+    ) -> None:
         vip_config = {
             "user-parameters": {
                 "actuator-address-book": [
