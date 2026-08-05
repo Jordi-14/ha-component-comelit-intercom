@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
@@ -14,8 +13,9 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .control_discovery import control_identity
+from .control_discovery import CONTROL_TYPE_ACTUATOR, control_identity
 from .coordinator import ComelitDataUpdateCoordinator
+from .video.models import Door
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ async def async_setup_entry(
 
     # Create button entities for each door
     entities: list[ButtonEntity] = []
-    doors = (coordinator.data or {}).get("doors", [])
+    doors = coordinator.device_config.doors if coordinator.device_config else []
 
     for door in doors:
         entities.append(ComelitDoorButton(coordinator, door))
@@ -55,16 +55,18 @@ class ComelitDoorButton(CoordinatorEntity[ComelitDataUpdateCoordinator], ButtonE
     def __init__(
         self,
         coordinator: ComelitDataUpdateCoordinator,
-        door: dict[str, Any],
+        door: Door,
     ) -> None:
         """Initialize the button."""
         super().__init__(coordinator)
         self._door = door
-        self._attr_name = door.get("name", "Unknown Door")
+        self._attr_name = door.name
 
         # Create unique ID based on host and door details
         entry_unique_id = coordinator.entry.unique_id or coordinator.host
-        control_type, apt_address, output_index, module_index = control_identity(door)
+        control_type, apt_address, output_index, module_index = control_identity(
+            _door_control(door)
+        )
         module_suffix = f"_{module_index}" if module_index is not None else ""
         door_id = f"{control_type}_{apt_address}_{output_index}{module_suffix}"
         self._attr_unique_id = f"{entry_unique_id}_{door_id}"
@@ -79,15 +81,30 @@ class ComelitDoorButton(CoordinatorEntity[ComelitDataUpdateCoordinator], ButtonE
 
     async def async_press(self) -> None:
         """Handle the button press."""
-        await self.coordinator.async_open_control(self._door)
+        await self.coordinator.async_open_door(self._door)
 
     @property
     def available(self) -> bool:
         """Return if entity is available."""
         return self.coordinator.last_update_success and any(
-            control_identity(d) == control_identity(self._door)
-            for d in (self.coordinator.data or {}).get("doors", [])
+            control_identity(_door_control(d))
+            == control_identity(_door_control(self._door))
+            for d in (
+                self.coordinator.device_config.doors
+                if self.coordinator.device_config
+                else []
+            )
         )
+
+
+def _door_control(door: Door) -> dict[str, object]:
+    """Convert a door model to the stable legacy identity fields."""
+    return {
+        "control-type": CONTROL_TYPE_ACTUATOR if door.is_actuator else "door",
+        "apt-address": door.apt_address,
+        "output-index": door.output_index,
+        "module-index": door.module_index,
+    }
 
 
 class _ComelitVideoButton(
@@ -96,7 +113,7 @@ class _ComelitVideoButton(
     """Base class for diagnostic video controls."""
 
     _attr_has_entity_name = True
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_category: EntityCategory | None = EntityCategory.DIAGNOSTIC
 
     def __init__(self, coordinator: ComelitDataUpdateCoordinator) -> None:
         super().__init__(coordinator)
@@ -127,7 +144,7 @@ class ComelitStartVideoButton(_ComelitVideoButton):
 
     async def async_press(self) -> None:
         """Start the live video feed."""
-        await self.coordinator.async_start_video()
+        await self.coordinator.async_start_video(by_user=True)
 
 
 class ComelitStopVideoButton(_ComelitVideoButton):
@@ -143,4 +160,5 @@ class ComelitStopVideoButton(_ComelitVideoButton):
 
     async def async_press(self) -> None:
         """Stop the live video feed."""
+        self.coordinator.request_video_stop()
         await self.coordinator.async_stop_video()

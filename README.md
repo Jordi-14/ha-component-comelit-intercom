@@ -9,13 +9,16 @@ This is a native Home Assistant integration for Comelit intercom systems (using 
 - Automatic discovery of all available doors and compatible relay/actuator controls
 - Creates button entities for each door and compatible relay/actuator control
 - **Live intercom video in Home Assistant** through a local H.264/RTSP relay
-- Start and stop video controls, with a JPEG preview on the camera entity
+- Doorbell, missed-call, door-opened, and interrupted-call event entity
+- Two-way audio through a bundled WebRTC card
+- Separate exterior-audio and microphone mute controls for browsers and the Home Assistant Companion app
+- An explicit notification when another client takes over the call
 - Simple configuration through Home Assistant UI
 - Works with Comelit intercom models that support the ICONA Bridge protocol
 
 ## Requirements
 
-- Home Assistant 2023.1 or newer
+- A current Home Assistant release with WebRTC camera support
 - Comelit intercom with WiFi connectivity (e.g., Comelit 6741W, 6721W)
 - Comelit device IP address
 - Device must be accessible on port 64100 (ICONA Bridge) and port 8080 (web interface for token extraction)
@@ -70,12 +73,36 @@ After configuration, the integration will:
 
 You can then:
 - Add door buttons to your dashboard
-- Press `Start video feed`, then open the `Live feed` camera entity to watch the entrance camera
-- Press `Stop video feed` when finished (opening a door stops an active feed before operating the relay)
+- Open the `Live feed` camera for an on-demand, receive-only camera view
+- Enable an exterior audio call and independently mute or unmute your microphone
 - Create automations to open doors based on events
 - Use with voice assistants ("Hey Google, press the front door button")
 - Include in scripts and scenes
 - Trigger from presence detection, NFC tags, etc.
+
+### Intercom card
+
+The integration installs `custom:comelit-intercom-card`. Add a Manual card and
+select the entities created for your Comelit device:
+
+```yaml
+type: custom:comelit-intercom-card
+entity: camera.comelit_intercom_live_feed
+call_entity: switch.comelit_intercom_exterior_audio
+door_entities:
+  - button.comelit_intercom_front_door
+  - button.comelit_intercom_gate
+```
+
+Opening the card starts video without requesting microphone access. The call
+toggle enables or ends exterior audio. Once enabled, the microphone button mutes
+or unmutes your browser/app microphone independently. Microphone access requires
+Home Assistant to be opened over HTTPS, including in the Companion app.
+
+The Start/Stop video entities remain available as diagnostic controls for
+automations and troubleshooting. Normal dashboard use does not require pressing
+Start first: opening the card starts an outbound view, while an incoming ring is
+handled by the persistent call listener.
 
 ## How It Works
 
@@ -146,8 +173,20 @@ The video signaling is based on the PCAP-verified implementation from
 with additional research from its actively maintained
 [`mnestrud/comelit-man`](https://github.com/mnestrud/comelit-man) fork. It has
 been proven on the Comelit 6701W and uses the same ICONA Bridge channels used by
-this integration. Other models, including the 6741W/6721W, remain device
-testing targets because firmware behavior may vary.
+this integration. The outbound video path has been verified on the Comelit
+6741W. Firmware behavior can still vary on other models.
+
+### Call and audio behavior
+
+Comelit permits only one client to own a call. If the Comelit mobile app takes
+over while Home Assistant is viewing, the camera records a `last_end_reason`,
+fires a `call_ended` event, and creates a persistent notification explaining the
+likely cause.
+
+Audio is kept separate from video, matching the Comelit app: viewing the camera
+does not by itself enable the exterior audio path. Audio behavior can vary by
+model and firmware; this beta targets the verified 6741W setup while retaining
+the inbound signaling path learned from other ICONA Bridge devices.
 
 ## Credits
 
@@ -162,6 +201,8 @@ This integration was made possible thanks to:
 - **[antoiba86's hass-comelit-intercom-local](https://github.com/antoiba86/hass-comelit-intercom-local)** - Apache-2.0-licensed local video signaling, RTP, and RTSP implementation used by the camera feature
 
 - **[mnestrud's comelit-man](https://github.com/mnestrud/comelit-man)** - Continued maintenance, compatibility work, and live-device video validation
+
+- **[cmos486's Ring Intercom Video Card](https://github.com/cmos486/ring-intercom-video-card)** - Apache-2.0-licensed WebRTC microphone and browser/Companion app signaling pattern used by the bundled card
 
 - **Protocol Reverse Engineering** - The complex binary protocol for door operations was decoded by analyzing the comelit-client implementation, particularly:
   - The specific byte patterns required for door commands (0x18c0, 0x1800, 0x1820)
@@ -197,7 +238,9 @@ This integration was made possible thanks to:
 - Connection issues on macOS with Python 3.13 (being investigated)
 - Very old firmware versions may use a different protocol
 - Only one ICONA operation runs at a time; configuration polling pauses while video is active
-- Live video is currently receive-only; two-way talk and doorbell events are not exposed
+- Only one app can own the Comelit call at a time
+- Two-way-audio behavior may vary between ICONA Bridge models and firmware versions
+- Browser microphone access requires HTTPS
 
 ## Developer Information
 

@@ -5,6 +5,7 @@ DOMAIN = "comelit_intercom"
 # Configuration keys
 CONF_HOST = "host"
 CONF_TOKEN = "token"
+CONF_ENABLE_NOTIFICATIONS = "enable_notifications"
 
 # Default values
 DEFAULT_NAME = "Comelit Intercom"

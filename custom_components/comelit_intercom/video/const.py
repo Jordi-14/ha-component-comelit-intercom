@@ -1,5 +1,7 @@
 """Constants used only by the isolated Comelit video transport."""
 
+DOMAIN = "comelit_intercom"
+
 _verbose_logging: bool = False
 
 

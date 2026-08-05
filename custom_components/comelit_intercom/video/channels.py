@@ -43,7 +43,7 @@ class Channel:
     is_open: bool = False
     open_event: asyncio.Event = field(default_factory=asyncio.Event)
     open_response_body: bytes = b""
-    response_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    response_queue: asyncio.Queue[bytes] = field(default_factory=asyncio.Queue)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def next_sequence(self) -> int:

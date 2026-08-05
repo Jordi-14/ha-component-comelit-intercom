@@ -1,7 +1,9 @@
 """Custom exceptions for the Comelit local library."""
 
+from homeassistant.exceptions import HomeAssistantError
 
-class ComelitError(Exception):
+
+class ComelitError(HomeAssistantError):
     """Base exception for all Comelit errors."""
 
 

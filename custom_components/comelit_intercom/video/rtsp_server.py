@@ -24,8 +24,10 @@ TCP interleaved RTP (RFC 2326 §10.12):
     $ | channel (1 byte) | length (2 bytes BE) | RTP packet
 
 Audio keepalive:
-    When no real audio is available, silent PCMA (0xD5) is sent every ~1s
-    so go2rtc and the stream worker stay connected between calls.
+    Between calls, silent PCMA (0xD5) is sent at the correct 20 ms cadence
+    so go2rtc's WebRTC session stays alive in the browser.  Silence is
+    suppressed during live calls (_ready_event set) to avoid glitches — if
+    no real audio arrives within 20 ms, the loop iterates without sending.
 """
 
 from __future__ import annotations
@@ -39,12 +41,9 @@ import socket
 import struct
 import time
 
-from .const import is_verbose_logging
-
 _LOGGER = logging.getLogger(__name__)
 
 _MAX_RTP_PAYLOAD = 1400  # bytes — safe MTU headroom
-_PCMA_SILENCE = bytes([0xD5] * 160)  # 20ms G.711 A-law silence
 
 # RTCP — seconds between 1900-01-01 (NTP epoch) and 1970-01-01 (Unix epoch).
 # Used to encode wall-clock time into the 64-bit NTP field of Sender Reports.
@@ -90,8 +89,9 @@ class LocalRtspServer:
         await server.stop()
     """
 
-    def __init__(self, bind_host: str = "127.0.0.1") -> None:
+    def __init__(self, bind_host: str = "127.0.0.1", port: int = 0) -> None:
         self._bind_host = bind_host
+        self._bind_port = port
         self._rtsp_port: int = 0
         self._server: asyncio.Server | None = None
 
@@ -103,6 +103,10 @@ class LocalRtspServer:
         # RTP pass-through queue: raw video RTP packets forwarded with
         # header rewrite only (no NAL reassembly / FU-A re-fragmentation).
         self.rtp_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)
+        # Backchannel queue: PCMA audio payloads received from go2rtc mic
+        # input (via ANNOUNCE/RECORD).  rtp_receiver reads from this queue
+        # to replace silence with real audio in _audio_send_loop.
+        self.backchannel_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)
 
         # UDP sockets — fallback for clients that request UDP transport
         self._video_sock: socket.socket | None = None
@@ -163,7 +167,7 @@ class LocalRtspServer:
         self._last_audio_rtp_ts: int = 0
 
         self._running = False
-        self._feed_tasks: list[asyncio.Task] = []
+        self._feed_tasks: list[asyncio.Task[None]] = []
 
         # Gated by the coordinator: set when a video session is producing
         # RTP, cleared during CTPP handshake and idle.  The PLAY handler
@@ -172,6 +176,11 @@ class LocalRtspServer:
         # with "Stream ended; no additional packets" and taking a 10 s
         # backoff when it reconnects into an in-flight handshake.
         self._ready_event: asyncio.Event = asyncio.Event()
+
+        # Set by _broadcast_rtp on the first packet of each call; cleared
+        # by reset() between calls.  The RTCP SR loop awaits this before
+        # emitting its first Sender Report.
+        self._first_media_event: asyncio.Event = asyncio.Event()
 
     @property
     def rtsp_url(self) -> str:
@@ -195,7 +204,7 @@ class LocalRtspServer:
         self._server = await asyncio.start_server(
             self._handle_client,
             self._bind_host,
-            0,
+            self._bind_port,
         )
         self._rtsp_port = self._server.sockets[0].getsockname()[1]
         self._running = True
@@ -203,16 +212,13 @@ class LocalRtspServer:
         # Persistent feed tasks — run for the lifetime of the server.
         # Passthrough loop is lower latency; falls back to NAL-based
         # path automatically if rtp_queue is not fed.
-        # Audio is disabled — the device's answer sequence isn't producing
-        # PCMA in this deployment, and the silent keepalive at 1 Hz caused
-        # HLS/WebRTC stutters by ticking the 8 kHz audio clock 50× too slow.
         self._feed_tasks = [
             asyncio.create_task(self._video_rtp_passthrough_loop()),
+            asyncio.create_task(self._audio_feed_loop()),
             asyncio.create_task(self._rtcp_sr_loop()),
         ]
 
-        if is_verbose_logging():
-            _LOGGER.info("RTSP server started: %s", self.rtsp_url)
+        _LOGGER.info("RTSP server started: %s", self.rtsp_url)
         return self.rtsp_url
 
     async def stop(self) -> None:
@@ -239,8 +245,7 @@ class LocalRtspServer:
                 sock.close()
                 setattr(self, sock_attr, None)
 
-        if is_verbose_logging():
-            _LOGGER.debug("RTSP server stopped")
+        _LOGGER.debug("RTSP server stopped")
 
     def mark_ready(self) -> None:
         """Signal that a video session is flowing — unblocks pending PLAYs."""
@@ -266,11 +271,10 @@ class LocalRtspServer:
             with contextlib.suppress(Exception):
                 c.writer.close()
         if clients:
-            if is_verbose_logging():
-                _LOGGER.debug(
-                    "RTSP: disconnected %d client(s) — forcing reconnect on new video session",
-                    len(clients),
-                )
+            _LOGGER.debug(
+                "RTSP: disconnected %d client(s) — forcing reconnect on new video session",
+                len(clients),
+            )
 
     def reset(self, renewal: bool = False) -> None:
         """Reset for a new or renewed video call session.
@@ -296,7 +300,7 @@ class LocalRtspServer:
             with contextlib.suppress(asyncio.QueueEmpty):
                 self.audio_queue.get_nowait()
                 drained_audio += 1
-        # Audio–video sync bootstrap: the audio feed loop has been advancing
+        # Audio-video sync bootstrap: the audio feed loop has been advancing
         # `_audio_ts` by 160 per 20 ms of silence since server start, so by
         # the time the first video frame of a new call arrives, audio is N
         # seconds ahead on the muxer's output timeline.  Without correction
@@ -324,6 +328,7 @@ class LocalRtspServer:
         self._video_octet_count = 0
         self._audio_pkt_count = 0
         self._audio_octet_count = 0
+        self._first_media_event.clear()
 
         # Re-prime all already-connected clients with current SPS+PPS.
         # New clients are primed in _prime_client_with_parameter_sets called
@@ -333,16 +338,15 @@ class LocalRtspServer:
         for client in list(self._active_clients):
             self._prime_client_with_parameter_sets(client)
 
-        if is_verbose_logging():
-            _LOGGER.debug(
-                "RTSP server reset (renewal=%s): drained %d NALs + %d audio, "
-                "%d client(s) remain, video_ts_out seeded to 0x%08X",
-                renewal,
-                drained_nal,
-                drained_audio,
-                len(self._active_clients),
-                self._video_ts_out,
-            )
+        _LOGGER.debug(
+            "RTSP server reset (renewal=%s): drained %d NALs + %d audio, "
+            "%d client(s) remain, video_ts_out seeded to 0x%08X",
+            renewal,
+            drained_nal,
+            drained_audio,
+            len(self._active_clients),
+            self._video_ts_out,
+        )
 
     # ------------------------------------------------------------------
     # RTSP request handling
@@ -354,8 +358,7 @@ class LocalRtspServer:
         """Handle one RTSP client connection."""
         peer = writer.get_extra_info("peername")
         client_host = peer[0] if peer else "unknown"
-        if is_verbose_logging():
-            _LOGGER.debug("RTSP client connected from %s", client_host)
+        _LOGGER.debug("RTSP client connected from %s", client_host)
 
         # Disable Nagle's algorithm — send RTP packets immediately
         # instead of batching them (adds up to 40ms latency per packet)
@@ -369,38 +372,19 @@ class LocalRtspServer:
 
         try:
             while self._running:
-                raw = b""
-                while b"\r\n\r\n" not in raw:
-                    chunk = await asyncio.wait_for(reader.read(4096), timeout=30.0)
-                    if not chunk:
-                        return
-                    raw += chunk
-
-                request = raw.decode("utf-8", errors="replace")
-                lines = [ln for ln in request.split("\r\n") if ln]
-                if not lines:
+                parsed = await self._read_rtsp_request(reader)
+                if parsed is None:
                     break
-
-                parts = lines[0].split()
-                if len(parts) < 2:
-                    break
-                method, url = parts[0], parts[1]
-
-                headers: dict[str, str] = {}
-                for line in lines[1:]:
-                    if ":" in line:
-                        k, v = line.split(":", 1)
-                        headers[k.strip().lower()] = v.strip()
-
-                cseq = headers.get("cseq", "1")
-                if is_verbose_logging():
-                    _LOGGER.debug("RTSP %s from %s", method, client_host)
+                method, url, headers, cseq = parsed
+                _LOGGER.debug("RTSP %s from %s", method, client_host)
 
                 if method == "OPTIONS":
                     self._send(
                         writer,
                         cseq,
-                        extra=("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n"),
+                        extra=(
+                            "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, ANNOUNCE, RECORD\r\n"
+                        ),
                     )
 
                 elif method == "DESCRIBE":
@@ -427,30 +411,6 @@ class LocalRtspServer:
                     )
 
                 elif method == "PLAY":
-                    # Stall PLAY until a video session is actually flowing.
-                    # If a stream_worker reconnects while CTPP is still
-                    # negotiating, responding 200 OK immediately would hand
-                    # it a silent stream — it errors ~1.6 s later with
-                    # "Stream ended" and HA backs off 10 s before retrying.
-                    # Waiting inside PLAY (up to 10 s) keeps the worker in
-                    # its connect phase, so when video becomes ready it
-                    # transitions directly to reading frames.
-                    if not self._ready_event.is_set():
-                        if is_verbose_logging():
-                            _LOGGER.debug(
-                                "PLAY from %s waiting for video readiness",
-                                client_host,
-                            )
-                        try:
-                            await asyncio.wait_for(
-                                self._ready_event.wait(), timeout=10.0
-                            )
-                        except TimeoutError:
-                            writer.write(
-                                f"RTSP/1.0 503 Service Unavailable\r\nCSeq: {cseq}\r\n\r\n".encode()
-                            )
-                            await writer.drain()
-                            break
                     self._send(
                         writer,
                         cseq,
@@ -458,14 +418,13 @@ class LocalRtspServer:
                     )
                     self._active_clients.append(client)
                     registered = True
-                    if is_verbose_logging():
-                        _LOGGER.info(
-                            "RTSP streaming → %s (video_ch=%s audio_ch=%s) [%d client(s) total]",
-                            client_host,
-                            client.video_ch,
-                            client.audio_ch,
-                            len(self._active_clients),
-                        )
+                    _LOGGER.info(
+                        "RTSP streaming → %s (video_ch=%s audio_ch=%s) [%d client(s) total]",
+                        client_host,
+                        client.video_ch,
+                        client.audio_ch,
+                        len(self._active_clients),
+                    )
                     # Immediately send in-band SPS + PPS to this client so
                     # FFmpeg's H.264 parser populates codecpar.format before
                     # the stream worker freezes its output template.  Without
@@ -480,6 +439,18 @@ class LocalRtspServer:
                     self._send(writer, cseq, extra=f"Session: {self._session_id}\r\n")
                     break
 
+                elif method == "ANNOUNCE":
+                    # go2rtc backchannel: drain the SDP body then hand off
+                    content_len = int(headers.get("content-length", 0))
+                    if content_len > 0:
+                        with contextlib.suppress(asyncio.IncompleteReadError):
+                            await reader.readexactly(content_len)
+                    self._send(writer, cseq)
+                    await writer.drain()
+                    _LOGGER.debug("Backchannel ANNOUNCE from %s", client_host)
+                    await self._handle_backchannel(reader, writer, client_host)
+                    break
+
                 else:
                     writer.write(
                         f"RTSP/1.0 405 Method Not Allowed\r\nCSeq: {cseq}\r\n\r\n".encode()
@@ -489,20 +460,44 @@ class LocalRtspServer:
         except (TimeoutError, ConnectionError):
             pass
         except Exception:
-            if is_verbose_logging():
-                _LOGGER.debug("RTSP client error", exc_info=True)
+            _LOGGER.debug("RTSP client error", exc_info=True)
         finally:
             if registered:
                 with contextlib.suppress(ValueError):
                     self._active_clients.remove(client)
-                if is_verbose_logging():
-                    _LOGGER.debug(
-                        "RTSP client disconnected from %s [%d client(s) remain]",
-                        client_host,
-                        len(self._active_clients),
-                    )
+                _LOGGER.debug(
+                    "RTSP client disconnected from %s [%d client(s) remain]",
+                    client_host,
+                    len(self._active_clients),
+                )
             with contextlib.suppress(Exception):
                 writer.close()
+
+    async def _read_rtsp_request(
+        self, reader: asyncio.StreamReader
+    ) -> tuple[str, str, dict[str, str], str] | None:
+        """Read one complete RTSP request. Returns (method, url, headers, cseq) or None on close."""
+        raw = b""
+        while b"\r\n\r\n" not in raw:
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=30.0)
+            if not chunk:
+                return None
+            raw += chunk
+        request = raw.decode("utf-8", errors="replace")
+        lines = [ln for ln in request.split("\r\n") if ln]
+        if not lines:
+            return None
+        parts = lines[0].split()
+        if len(parts) < 2:
+            return None
+        method, url = parts[0], parts[1]
+        headers: dict[str, str] = {}
+        for line in lines[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+        cseq = headers.get("cseq", "1")
+        return method, url, headers, cseq
 
     def _parse_setup(
         self,
@@ -568,6 +563,16 @@ class LocalRtspServer:
             f"profile-level-id={profile_level_id};"
             f"sprop-parameter-sets={sps_b64},{pps_b64}\r\n"
             "a=control:video\r\n"
+            "m=audio 0 RTP/AVP 8\r\n"
+            "c=IN IP4 0.0.0.0\r\n"
+            "a=rtpmap:8 PCMA/8000\r\n"
+            "a=sendonly\r\n"
+            "a=control:audio\r\n"
+            "m=audio 0 RTP/AVP 8\r\n"
+            "c=IN IP4 0.0.0.0\r\n"
+            "a=rtpmap:8 PCMA/8000\r\n"
+            "a=recvonly\r\n"
+            "a=control:backchannel\r\n"
         )
 
     async def _wait_for_teardown(self, reader: asyncio.StreamReader) -> None:
@@ -579,6 +584,94 @@ class LocalRtspServer:
                     break
             except TimeoutError:
                 pass
+
+    async def _handle_backchannel(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        client_host: str,
+    ) -> None:
+        """Handle SETUP + RECORD for a backchannel connection (after ANNOUNCE accepted)."""
+        backchannel_ch = 0
+        try:
+            while self._running:
+                parsed = await self._read_rtsp_request(reader)
+                if parsed is None:
+                    break
+                method, _url, hdrs, cseq = parsed
+                _LOGGER.debug("Backchannel %s from %s", method, client_host)
+
+                if method == "SETUP":
+                    transport_hdr = hdrs.get("transport", "")
+                    for part in transport_hdr.split(";"):
+                        if "interleaved" in part:
+                            backchannel_ch = int(part.split("=", 1)[1].split("-")[0])
+                    self._send(
+                        writer,
+                        cseq,
+                        extra=f"Session: {self._session_id}\r\nTransport: RTP/AVP/TCP;unicast;interleaved={backchannel_ch}-{backchannel_ch + 1}\r\n",
+                    )
+                    await writer.drain()
+
+                elif method == "RECORD":
+                    self._send(writer, cseq, extra=f"Session: {self._session_id}\r\n")
+                    await writer.drain()
+                    _LOGGER.info(
+                        "Backchannel RECORD from %s — mic audio flowing", client_host
+                    )
+                    await self._receive_backchannel_rtp(reader)
+                    break
+
+                elif method == "TEARDOWN":
+                    self._send(writer, cseq, extra=f"Session: {self._session_id}\r\n")
+                    await writer.drain()
+                    break
+
+                else:
+                    writer.write(
+                        f"RTSP/1.0 405 Method Not Allowed\r\nCSeq: {cseq}\r\n\r\n".encode()
+                    )
+                    await writer.drain()
+        except (TimeoutError, ConnectionError, asyncio.IncompleteReadError):
+            pass
+        except Exception:
+            _LOGGER.debug("Backchannel error", exc_info=True)
+        _LOGGER.debug("Backchannel connection from %s closed", client_host)
+
+    async def _receive_backchannel_rtp(self, reader: asyncio.StreamReader) -> None:
+        """Read interleaved RTP from backchannel connection and queue audio payloads."""
+        while self._running:
+            try:
+                header = await asyncio.wait_for(reader.readexactly(4), timeout=30.0)
+            except asyncio.IncompleteReadError:
+                break
+            except ConnectionError:
+                break
+            except TimeoutError:
+                continue
+
+            if header[0] != 0x24:
+                # Non-interleaved data (e.g. TEARDOWN) — drain and exit
+                rest = header
+                with contextlib.suppress(Exception):
+                    while b"\r\n\r\n" not in rest:
+                        chunk = await asyncio.wait_for(reader.read(256), timeout=5.0)
+                        if not chunk:
+                            break
+                        rest += chunk
+                break
+
+            length = struct.unpack("!H", header[2:4])[0]
+            try:
+                rtp = await asyncio.wait_for(reader.readexactly(length), timeout=5.0)
+            except (asyncio.IncompleteReadError, TimeoutError):
+                break
+
+            if len(rtp) >= 12:
+                payload = rtp[12:]
+                if payload:
+                    with contextlib.suppress(asyncio.QueueFull):
+                        self.backchannel_queue.put_nowait(payload)
 
     # ------------------------------------------------------------------
     # RTP broadcast
@@ -621,17 +714,15 @@ class LocalRtspServer:
                     struct.pack("!BBH", 0x24, client.video_ch, len(pkt)) + pkt
                 )
             except Exception:
-                if is_verbose_logging():
-                    _LOGGER.debug(
-                        "Failed to prime client with parameter sets", exc_info=True
-                    )
+                _LOGGER.debug(
+                    "Failed to prime client with parameter sets", exc_info=True
+                )
                 return
-        if is_verbose_logging():
-            _LOGGER.debug(
-                "Primed RTSP client with SPS (%d B) + PPS (%d B)",
-                len(self._latest_sps),
-                len(self._latest_pps),
-            )
+        _LOGGER.debug(
+            "Primed RTSP client with SPS (%d B) + PPS (%d B)",
+            len(self._latest_sps),
+            len(self._latest_pps),
+        )
 
     def _send_initial_sr_to_client(self, client: _TcpClient) -> None:
         """Send a one-shot video + audio SR to a single client before any RTP.
@@ -677,6 +768,7 @@ class LocalRtspServer:
         the active list so we don't keep writing into a closed socket and
         leaking error log spam every 20ms.
         """
+        self._first_media_event.set()
         dead: list[_TcpClient] = []
         for c in list(self._active_clients):
             ch = c.video_ch if is_video else c.audio_ch
@@ -695,11 +787,10 @@ class LocalRtspServer:
                 self._active_clients.remove(c)
             with contextlib.suppress(Exception):
                 c.writer.close()
-            if is_verbose_logging():
-                _LOGGER.info(
-                    "Removed dead RTSP client [%d remain]",
-                    len(self._active_clients),
-                )
+            _LOGGER.info(
+                "Removed dead RTSP client [%d remain]",
+                len(self._active_clients),
+            )
 
         # UDP fallback — single client (last SETUP wins)
         if self._udp_host:
@@ -774,22 +865,20 @@ class LocalRtspServer:
         except asyncio.CancelledError:
             pass
         except Exception:
-            if is_verbose_logging():
-                _LOGGER.debug("Video RTP pass-through loop error", exc_info=True)
+            _LOGGER.debug("Video RTP pass-through loop error", exc_info=True)
 
     def _translate_video_ts(self, device_ts: int) -> None:
         """Translate device RTP timestamp to monotonic output timestamp."""
         if self._last_device_ts is None or self._video_ts_rebase_pending:
             self._video_ts_offset = (self._video_ts_out + 1 - device_ts) & 0xFFFFFFFF
             self._video_ts_rebase_pending = False
-            if is_verbose_logging():
-                _LOGGER.debug(
-                    "Video timestamp rebased: device=0x%08X seed=0x%08X new_out=0x%08X offset=0x%08X",
-                    device_ts,
-                    self._video_ts_out,
-                    (device_ts + self._video_ts_offset) & 0xFFFFFFFF,
-                    self._video_ts_offset,
-                )
+            _LOGGER.debug(
+                "Video timestamp rebased: device=0x%08X seed=0x%08X new_out=0x%08X offset=0x%08X",
+                device_ts,
+                self._video_ts_out,
+                (device_ts + self._video_ts_offset) & 0xFFFFFFFF,
+                self._video_ts_offset,
+            )
         else:
             forward = (device_ts - self._last_device_ts) & 0xFFFFFFFF
             if forward > 0x80000000:
@@ -797,15 +886,13 @@ class LocalRtspServer:
                 self._video_ts_offset = (
                     self._video_ts_out + 1 - device_ts
                 ) & 0xFFFFFFFF
-                if is_verbose_logging():
-                    _LOGGER.debug(
-                        "Video timestamp rebased (backward): device=0x%08X "
-                        "prev_out=0x%08X new_out=0x%08X offset=0x%08X",
-                        device_ts,
-                        prev_out,
-                        (device_ts + self._video_ts_offset) & 0xFFFFFFFF,
-                        self._video_ts_offset,
-                    )
+                _LOGGER.debug(
+                    "Video timestamp rebased (backward): device=0x%08X prev_out=0x%08X new_out=0x%08X offset=0x%08X",
+                    device_ts,
+                    prev_out,
+                    (device_ts + self._video_ts_offset) & 0xFFFFFFFF,
+                    self._video_ts_offset,
+                )
         self._last_device_ts = device_ts
         self._video_ts_out = (device_ts + self._video_ts_offset) & 0xFFFFFFFF
 
@@ -888,26 +975,24 @@ class LocalRtspServer:
                         self._video_ts_out + 1 - device_ts
                     ) & 0xFFFFFFFF
                     self._video_ts_rebase_pending = False
-                    if is_verbose_logging():
-                        _LOGGER.debug(
-                            "Video timestamp rebased (bootstrap): device_ts=0x%08X out=0x%08X offset=0x%08X",
-                            device_ts,
-                            self._video_ts_out + 1,
-                            self._video_ts_offset,
-                        )
+                    _LOGGER.debug(
+                        "Video timestamp rebased (bootstrap): device_ts=0x%08X out=0x%08X offset=0x%08X",
+                        device_ts,
+                        self._video_ts_out + 1,
+                        self._video_ts_offset,
+                    )
                 else:
                     forward = (device_ts - self._last_device_ts) & 0xFFFFFFFF
                     if forward > 0x80000000:
                         self._video_ts_offset = (
                             self._video_ts_out + 1 - device_ts
                         ) & 0xFFFFFFFF
-                        if is_verbose_logging():
-                            _LOGGER.debug(
-                                "Video timestamp rebased (backward jump): device_ts=0x%08X out=0x%08X offset=0x%08X",
-                                device_ts,
-                                self._video_ts_out + 1,
-                                self._video_ts_offset,
-                            )
+                        _LOGGER.debug(
+                            "Video timestamp rebased (backward jump): device_ts=0x%08X out=0x%08X offset=0x%08X",
+                            device_ts,
+                            self._video_ts_out + 1,
+                            self._video_ts_offset,
+                        )
 
                 self._last_device_ts = device_ts
                 self._video_ts_out = (device_ts + self._video_ts_offset) & 0xFFFFFFFF
@@ -917,8 +1002,7 @@ class LocalRtspServer:
         except asyncio.CancelledError:
             pass
         except Exception:
-            if is_verbose_logging():
-                _LOGGER.debug("Video feed loop error", exc_info=True)
+            _LOGGER.debug("Video feed loop error", exc_info=True)
 
     def _send_h264(self, nal_data: bytes) -> None:
         """Packetize one H.264 NAL unit and broadcast to all clients."""
@@ -974,17 +1058,24 @@ class LocalRtspServer:
     async def _audio_feed_loop(self) -> None:
         """Broadcast G.711 PCMA to all registered clients.
 
-        When no real audio is queued, sends silence every ~1s to keep
-        go2rtc and the stream worker alive between calls.
+        Between calls (_ready_event clear), sends silent PCMA (0xD5) at the
+        correct 20 ms cadence so go2rtc's WebRTC session stays alive in the
+        browser.  Silence is suppressed during live calls (_ready_event set)
+        to avoid glitches; if no real audio arrives within 20 ms in that case,
+        the loop iterates without sending.
         """
+        _silence = b"\xd5" * 160
         try:
             while self._running:
                 try:
                     payload = await asyncio.wait_for(
-                        self.audio_queue.get(), timeout=1.0
+                        self.audio_queue.get(), timeout=0.020
                     )
                 except TimeoutError:
-                    payload = _PCMA_SILENCE
+                    if not self._ready_event.is_set() and self._active_clients:
+                        payload = _silence
+                    else:
+                        continue
 
                 pkt = _build_rtp(
                     pt=8,
@@ -1004,8 +1095,7 @@ class LocalRtspServer:
         except asyncio.CancelledError:
             pass
         except Exception:
-            if is_verbose_logging():
-                _LOGGER.debug("Audio feed loop error", exc_info=True)
+            _LOGGER.debug("Audio feed loop error", exc_info=True)
 
     # ------------------------------------------------------------------
     # RTCP — Sender Reports
@@ -1024,12 +1114,7 @@ class LocalRtspServer:
             # the first SR immediately — clients that haven't seen an SR yet
             # stall their decoders for seconds trying to infer a reference
             # clock from RTP alone.  After that, cadence per RFC 3550.
-            while (
-                self._running
-                and self._video_pkt_count == 0
-                and self._audio_pkt_count == 0
-            ):
-                await asyncio.sleep(0.05)
+            await self._first_media_event.wait()
 
             while self._running:
                 if self._active_clients or self._udp_host:
@@ -1060,8 +1145,7 @@ class LocalRtspServer:
         except asyncio.CancelledError:
             pass
         except Exception:
-            if is_verbose_logging():
-                _LOGGER.debug("RTCP SR loop error", exc_info=True)
+            _LOGGER.debug("RTCP SR loop error", exc_info=True)
 
     def _broadcast_rtcp(self, pkt: bytes, is_video: bool) -> None:
         """Send one RTCP packet to every TCP and UDP client.

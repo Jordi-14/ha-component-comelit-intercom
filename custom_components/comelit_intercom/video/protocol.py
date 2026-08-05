@@ -6,7 +6,7 @@ import json
 import struct
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any
+from typing import Any, cast
 
 from .const import VIDEO_FPS, VIDEO_HEIGHT, VIDEO_WIDTH
 
@@ -17,7 +17,10 @@ NULL = b"\x00"
 
 # CTPP init message magic byte sequences (from PCAP analysis)
 _CTPP_INIT_FLAGS1 = bytes([0x00, 0x11])
-_CTPP_INIT_FLAGS2 = bytes([0x00, 0x40])  # possibly capability bitmask
+_CTPP_INIT_FLAGS2 = bytes([0x00, 0x40])
+_CTPP_INIT_CAPABILITY = bytes(
+    [0x18, 0xC2]
+)  # protocol constant (PCAP-verified; echoed by device in renewals)
 _CTPP_INIT_SEPARATOR = bytes([0x10, 0x0E])
 _CTPP_INIT_ZERO_PAD = bytes([0x00, 0x00, 0x00, 0x00])
 _CTPP_ADDR_WILDCARD = bytes([0xFF, 0xFF, 0xFF, 0xFF])
@@ -66,10 +69,7 @@ def encode_json_message(msg: dict[str, Any], request_id: int) -> bytes:
 
 def decode_json_body(body: bytes) -> dict[str, Any]:
     """Decode a JSON body."""
-    decoded = json.loads(body.decode("utf-8"))
-    if not isinstance(decoded, dict):
-        raise ValueError("Expected a JSON object")
-    return decoded
+    return cast("dict[str, Any]", json.loads(body.decode("utf-8")))
 
 
 def _null_terminated(s: str) -> bytes:
@@ -178,9 +178,7 @@ def encode_ctpp_init(
         buf += _CTPP_LEGACY_TS
     buf += _CTPP_INIT_FLAGS1
     buf += _CTPP_INIT_FLAGS2
-    # Mystery bytes — echoed back by device; PCAP shows varying values
-    # but the device accepts any value here.
-    buf += struct.pack("<H", (timestamp or 0x238BAC) & 0xFFFF)
+    buf += _CTPP_INIT_CAPABILITY
     buf += _null_terminated(addr_with_sub)
     buf += _CTPP_INIT_SEPARATOR
     buf += _CTPP_INIT_ZERO_PAD
@@ -274,6 +272,10 @@ ACTION_PEER = 0x0070  # "accept call" / peer (answer sequence msg 1)
 ACTION_CONFIG_ACK = 0x000E  # supplemental config ACK (answer sequence msg 2)
 ACTION_HANGUP = 0x002D  # '-' = hangup
 ACTION_DOOR_OPEN = 0x000D  # door open on active video CTPP channel (PCAP-verified)
+ACTION_CALL_ACCEPTED = 0x0002  # device→app on outbound; app→device on inbound answer
+ACTION_RTPC2_READY = (
+    0x0003  # sent by app after RTPC2 opens on inbound answer (PCAP-verified)
+)
 
 
 def _build_ctpp_video_msg(
@@ -327,11 +329,14 @@ def encode_call_init(caller: str, callee: str, timestamp: int) -> bytes:
     return bytes(buf)
 
 
-def encode_call_ack(caller: str, callee: str, timestamp: int) -> bytes:
+def encode_call_ack(
+    caller: str, callee: str, timestamp: int, codec_param: int = 0x27
+) -> bytes:
     """Encode codec negotiation / call ack (4018 prefix, action 0x0008).
 
     Sent after receiving initial call responses.
-    Extra bytes: 0x49='I' codec marker, 0x00, 0x27=39 (codec param), padding.
+    Extra bytes: 0x49='I' codec marker, 0x00, codec_param, padding.
+    codec_param: 0x27 for outbound (HA-initiated), 0x07 for inbound (PCAP-verified).
     """
     return _build_ctpp_video_msg(
         prefix=0x1840,
@@ -340,7 +345,7 @@ def encode_call_ack(caller: str, callee: str, timestamp: int) -> bytes:
         flags=0x0003,
         caller=caller,
         callee=callee,
-        extra=bytes([0x49, 0x00, 0x27, 0x00, 0x00, 0x00]),
+        extra=bytes([0x49, 0x00, codec_param, 0x00, 0x00, 0x00]),
     )
 
 
@@ -418,7 +423,9 @@ def encode_video_config(
     extra = bytearray()
     extra += bytes([0x14, 0x32, 0x00, 0x00, 0x00, 0x00])
     extra += struct.pack("<H", rtpc2_req_id)
-    extra += bytes([0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00])
+    extra += bytes(
+        [0xFF, 0xFF, 0xC0, 0x00, 0x00, 0x00]
+    )  # PCAP2: extra[10:14]=c0 00 00 00
     extra += struct.pack("<H", width)
     extra += struct.pack("<H", height)
     # PCAP shows 320x240 as the secondary resolution (not width//2)
@@ -494,17 +501,21 @@ def encode_answer_video_reconfig(
 
 def encode_answer_peer(
     caller: str,
-    entrance_addr: str,
+    callee: str,
     timestamp: int,
     renewal: bool = False,
+    inbound: bool = False,
 ) -> bytes:
     """Encode peer/accept message (action 0x70).
 
-    PCAP-verified wire format:
+    Wire format (PCAP2-verified for both outbound and inbound):
       [prefix LE16] [timestamp LE32] [inner_len BE16] [0x0070 BE16]
-      [caller\\0] [flag 0x01 0x00] [0xFFFFFFFF]
-      [caller\\0] [entrance_addr\\0\\0]
-    inner_payload = caller (our full address e.g. "SB0000061") + \\0 + [flag, 0x00]
+      [caller\\0] [flag 0x01 0x00] [0x0000 if inbound] [0xFFFFFFFF]
+      [caller\\0] [callee\\0\\0]
+
+    Outbound: callee=entrance_addr, no extra padding before separator.
+    Inbound:  callee=our_base_addr, extra 0x0000 padding before separator.
+    Both formats include caller after the separator.
 
     Initial call: prefix=0x1840, flag=0x01
     Renewal:      prefix=0x1860, flag=0x00
@@ -518,9 +529,11 @@ def encode_answer_peer(
     buf += struct.pack(">H", 2 + len(inner_payload))  # inner_len = action(2) + payload
     buf += struct.pack(">H", ACTION_PEER)  # 0x0070
     buf += inner_payload
+    if inbound:
+        buf += b"\x00\x00"  # extra padding before separator (PCAP2-verified)
     buf += b"\xff\xff\xff\xff"
     buf += _null_terminated(caller)
-    buf += entrance_addr.encode("ascii") + b"\x00\x00"
+    buf += callee.encode("ascii") + b"\x00\x00"
     return bytes(buf)
 
 
@@ -547,34 +560,64 @@ def encode_answer_config_ack(
     return bytes(buf)
 
 
+def encode_rtpc2_ready(caller: str, callee: str, timestamp: int) -> bytes:
+    """Encode RTPC2-ready message (0x1840/0x0003, flags=0x000A).
+
+    Sent immediately after RTPC2 opens on inbound answer calls. From PCAP:
+    extra=b"\\x00\\x00". Purpose unknown; required by device to proceed.
+    """
+    return _build_ctpp_video_msg(
+        prefix=0x1840,
+        timestamp=timestamp,
+        action=ACTION_RTPC2_READY,
+        flags=0x000A,
+        caller=caller,
+        callee=callee,
+        extra=b"\x00\x00",
+    )
+
+
+def encode_call_accepted(caller: str, callee: str, timestamp: int) -> bytes:
+    """Encode call-accepted message sent TO the device on inbound answer.
+
+    On inbound calls the roles are reversed: the app sends ACTION_CALL_ACCEPTED
+    (0x1840/0x0002, flags=0x000C) to the device instead of waiting to receive it.
+    PCAP2-verified extra=b"\\x00\\x00" (4 total FF bytes = separator only).
+    Sent after the PEER message.
+    """
+    return _build_ctpp_video_msg(
+        prefix=0x1840,
+        timestamp=timestamp,
+        action=ACTION_CALL_ACCEPTED,
+        flags=0x000C,
+        caller=caller,
+        callee=callee,
+        extra=b"\x00\x00",
+    )
+
+
 def encode_door_open_during_video(
     our_addr: str,
     entrance_addr: str,
     call_counter: int,
     relay_index: int,
-    apt_addr: str | None = None,
 ) -> bytes:
     """Encode a door open command for use on an active video CTPP channel.
 
-    PCAP-verified (notification+opendoorwhilevideo.pcap, frames 450/850):
+    PCAP-verified (camera_feed_with_open_door_local.pcap): during video the
+    Android app sends a SINGLE 0x1840/0x000D message on the existing video
+    CTPP channel — no separate channel open, no 6-step sequence.
 
+    Body structure (48 bytes):
       [LE16 0x1840] [LE32 counter] [BE16 0x000D] [BE16 0x002D]
-      [entrance_addr padded to 10] [LE32 relay_index] [4× 0xFF]
-      [our_addr padded to 10] [apt_addr padded to 10]
+      [entrance_addr padded to 10] [LE32 relay_index] [4x 0xFF]
+      [our_addr padded to 10] [entrance_addr padded to 10]
 
-    The trailing 10 bytes are `apt_addr` (the apartment address WITHOUT the
-    subaddress, e.g. "SB000006"), not entrance_addr. The earlier
-    `camera_feed_with_open_door_local.pcap` happened to have apt_addr equal
-    to entrance_addr, which masked this bug.
-
-    `apt_addr` is optional for backwards compatibility; if omitted it falls
-    back to entrance_addr (the previous, buggy behavior). Callers should
-    always pass it.
+    relay_index: the door's output_index from the device config (PCAP shows 1
+    for the only door on that device; use door.output_index for our device).
     """
-    apt_addr = apt_addr if apt_addr is not None else entrance_addr
     our_b = our_addr.encode("ascii").ljust(10, b"\x00")[:10]
     entr_b = entrance_addr.encode("ascii").ljust(10, b"\x00")[:10]
-    apt_b = apt_addr.encode("ascii").ljust(10, b"\x00")[:10]
     buf = bytearray()
     buf += struct.pack("<H", 0x1840)
     buf += struct.pack("<I", call_counter)
@@ -584,7 +627,7 @@ def encode_door_open_during_video(
     buf += struct.pack("<I", relay_index)
     buf += b"\xff\xff\xff\xff"
     buf += our_b
-    buf += apt_b
+    buf += entr_b
     return bytes(buf)
 
 

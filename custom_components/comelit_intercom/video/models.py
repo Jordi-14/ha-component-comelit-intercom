@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -39,7 +40,7 @@ class DeviceConfig:
     caller_address: str = ""  # from entrance-address-book (app/indoor unit address)
     doors: list[Door] = field(default_factory=list)
     cameras: list[Camera] = field(default_factory=list)
-    raw: dict | None = None
+    raw: dict[str, Any] | None = None
 
 
 @dataclass
@@ -49,4 +50,4 @@ class PushEvent:
     event_type: str
     apt_address: str = ""
     timestamp: float = 0.0
-    raw: dict | None = None
+    raw: dict[str, Any] | None = None

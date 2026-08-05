@@ -1,0 +1,280 @@
+/**
+ * Comelit Intercom Card
+ * SPDX-License-Identifier: Apache-2.0
+ * WebRTC microphone flow adapted from cmos486/ring-intercom-video-card.
+ */
+
+const CARD_TAG = "comelit-intercom-card";
+
+class ComelitIntercomCard extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+    this._pc = null;
+    this._mic = null;
+    this._sessionId = null;
+    this._pendingCandidates = [];
+    this._connected = false;
+    this._micEnabled = false;
+    this._autoStarted = false;
+  }
+
+  static getStubConfig() {
+    return { entity: "camera.comelit_intercom_live_feed" };
+  }
+
+  setConfig(config) {
+    if (!config.entity) throw new Error("A Comelit camera entity is required");
+    this._config = config;
+    this._render();
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    this._refreshIdleState();
+    if (this._config && !this._autoStarted) {
+      this._autoStarted = true;
+      queueMicrotask(() => this._connect(false));
+    }
+  }
+
+  getCardSize() {
+    return 5;
+  }
+
+  _render() {
+    const doors = this._config.door_entities ||
+      (this._config.door_entity ? [this._config.door_entity] : []);
+    const doorButtons = doors.map((entity, index) =>
+      `<button class="door" data-entity="${entity}">OPEN ${index + 1}</button>`,
+    ).join("");
+    this.shadowRoot.innerHTML = `
+      <style>
+        ha-card { overflow: hidden; }
+        .video { position: relative; aspect-ratio: 4 / 3; background: #000; }
+        video { width: 100%; height: 100%; object-fit: contain; }
+        .status { position: absolute; left: 10px; bottom: 10px; max-width: calc(100% - 36px);
+          color: white; background: rgba(0,0,0,.7); border-radius: 6px; padding: 6px 8px;
+          font-size: 12px; }
+        .controls { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; padding: 14px; }
+        button { min-height: 48px; border: 0; border-radius: 10px; color: white;
+          font-size: 14px; font-weight: 600; cursor: pointer; touch-action: none; }
+        button:disabled { opacity: .4; cursor: default; }
+        #connect { background: #008f5a; }
+        #connect.active { background: #c62828; }
+        #mic { background: #555; }
+        #mic.active { background: #008f5a; }
+        .door { background: #ef6c00; }
+      </style>
+      <ha-card>
+        <div class="video">
+          <video autoplay playsinline></video>
+          <div class="status">Idle</div>
+        </div>
+        <div class="controls">
+          <button id="connect">START CALL</button>
+          <button id="mic" disabled>MIC MUTED</button>
+          ${doorButtons}
+        </div>
+      </ha-card>`;
+
+    this.shadowRoot.getElementById("connect").onclick = () => this._toggleCall();
+    this.shadowRoot.getElementById("mic").onclick = () =>
+      this._setMic(!this._micEnabled);
+    this.shadowRoot.querySelectorAll(".door").forEach((button) => {
+      button.onclick = () => this._press(button.dataset.entity);
+    });
+  }
+
+  _cameraState() {
+    return this._hass?.states?.[this._config.entity];
+  }
+
+  _isInbound() {
+    return this._cameraState()?.attributes?.call_direction === "inbound";
+  }
+
+  _refreshIdleState() {
+    if (!this.shadowRoot || this._connected || this._pc) return;
+    const state = this._cameraState();
+    const connect = this.shadowRoot.getElementById("connect");
+    if (connect) connect.textContent = this._isInbound() ? "ANSWER CALL" : "START CALL";
+    const reason = state?.attributes?.last_end_reason;
+    if (reason) this._status(reason);
+  }
+
+  _status(text) {
+    const status = this.shadowRoot?.querySelector(".status");
+    if (status) status.textContent = text;
+  }
+
+  async _press(entityId) {
+    if (!entityId) return;
+    await this._hass.callService("button", "press", { entity_id: entityId });
+  }
+
+  async _setCall(enabled) {
+    if (this._config.call_entity) {
+      await this._hass.callService("switch", enabled ? "turn_on" : "turn_off", {
+        entity_id: this._config.call_entity,
+      });
+    } else if (enabled && this._config.answer_entity) {
+      await this._press(this._config.answer_entity);
+    }
+  }
+
+  async _toggleCall() {
+    const wasAudioCall = Boolean(this._mic);
+    this._teardown(false);
+    if (wasAudioCall) {
+      this._status("Ending exterior audio…");
+      await this._setCall(false);
+      await this._connect(false);
+    } else {
+      await this._connect(true);
+    }
+  }
+
+  async _connect(withAudio) {
+    if (this._pc) return;
+    const connect = this.shadowRoot.getElementById("connect");
+    connect.disabled = true;
+    this._status(withAudio ? "Requesting microphone…" : "Connecting video…");
+
+    try {
+      if (withAudio) {
+        if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+          throw new Error("Microphone access requires an HTTPS Home Assistant URL");
+        }
+        this._mic = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          video: false,
+        });
+        this._mic.getAudioTracks().forEach((track) => { track.enabled = false; });
+        await this._setCall(true);
+      }
+
+      this._pc = new RTCPeerConnection({ iceServers: [], bundlePolicy: "max-bundle" });
+      if (this._mic) {
+        const track = this._mic.getAudioTracks()[0];
+        this._pc.addTransceiver(track, { direction: "sendrecv", streams: [this._mic] });
+      } else {
+        this._pc.addTransceiver("audio", { direction: "recvonly" });
+      }
+      this._pc.addTransceiver("video", { direction: "recvonly" });
+      this._pc.ontrack = (event) => {
+        const video = this.shadowRoot.querySelector("video");
+        if (!video.srcObject) video.srcObject = new MediaStream();
+        video.srcObject.addTrack(event.track);
+      };
+      this._pc.onconnectionstatechange = () => {
+        if (!this._pc) return;
+        this._status(this._pc.connectionState);
+        if (this._pc.connectionState === "connected") {
+          this._connected = true;
+          const call = this.shadowRoot.getElementById("connect");
+          call.disabled = false;
+          call.textContent = this._mic ? "END CALL" : "ENABLE AUDIO";
+          call.classList.toggle("active", Boolean(this._mic));
+          this.shadowRoot.getElementById("mic").disabled = !this._mic;
+        } else if (["failed", "closed"].includes(this._pc.connectionState)) {
+          this._teardown();
+        }
+      };
+      this._pc.onicecandidate = async (event) => {
+        if (!event.candidate?.candidate) return;
+        const candidate = {
+          candidate: event.candidate.candidate,
+          sdpMid: event.candidate.sdpMid,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+        };
+        if (!this._sessionId) this._pendingCandidates.push(candidate);
+        else await this._sendCandidate(candidate);
+      };
+
+      const offer = await this._pc.createOffer();
+      await this._pc.setLocalDescription(offer);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      this._unsubscribe = await this._hass.connection.subscribeMessage(
+        (message) => this._onSignal(message),
+        {
+          type: "camera/webrtc/offer",
+          entity_id: this._config.entity,
+          offer: this._pc.localDescription.sdp,
+        },
+      );
+    } catch (error) {
+      this._status(error.message);
+      this._teardown(false);
+    }
+  }
+
+  async _sendCandidate(candidate) {
+    if (!this._sessionId) return;
+    await this._hass.connection.sendMessagePromise({
+      type: "camera/webrtc/candidate",
+      entity_id: this._config.entity,
+      session_id: this._sessionId,
+      candidate,
+    });
+  }
+
+  async _onSignal(message) {
+    if (message.type === "session") {
+      this._sessionId = message.session_id;
+      for (const candidate of this._pendingCandidates.splice(0)) {
+        await this._sendCandidate(candidate);
+      }
+    } else if (message.type === "answer") {
+      await this._pc.setRemoteDescription({ type: "answer", sdp: message.answer });
+    } else if (message.type === "candidate") {
+      await this._pc.addIceCandidate(message.candidate);
+    } else if (message.type === "error") {
+      this._status(message.message || message.code);
+    }
+  }
+
+  _setMic(enabled) {
+    if (!this._connected || !this._mic) return;
+    this._mic.getAudioTracks().forEach((track) => { track.enabled = enabled; });
+    this._micEnabled = enabled;
+    const mic = this.shadowRoot.getElementById("mic");
+    mic.textContent = enabled ? "MIC ON" : "MIC MUTED";
+    mic.classList.toggle("active", enabled);
+  }
+
+  _teardown(setIdle = true) {
+    this._connected = false;
+    this._micEnabled = false;
+    const video = this.shadowRoot?.querySelector("video");
+    if (video?.srcObject) {
+      video.srcObject.getTracks().forEach((track) => track.stop());
+      video.srcObject = null;
+    }
+    if (this._unsubscribe) this._unsubscribe();
+    this._unsubscribe = null;
+    if (this._pc) this._pc.close();
+    this._pc = null;
+    if (this._mic) this._mic.getTracks().forEach((track) => track.stop());
+    this._mic = null;
+    this._sessionId = null;
+    this._pendingCandidates = [];
+    const mic = this.shadowRoot?.getElementById("mic");
+    if (mic) { mic.disabled = true; mic.textContent = "MIC MUTED"; mic.classList.remove("active"); }
+    const connect = this.shadowRoot?.getElementById("connect");
+    if (connect) { connect.disabled = false; connect.textContent = "ENABLE AUDIO"; connect.classList.remove("active"); }
+    if (setIdle) this._status("Idle");
+  }
+
+  disconnectedCallback() {
+    this._teardown();
+  }
+}
+
+customElements.define(CARD_TAG, ComelitIntercomCard);
+window.customCards = window.customCards || [];
+window.customCards.push({
+  type: CARD_TAG,
+  name: "Comelit Intercom Card",
+  description: "Video, exterior audio, microphone, and door controls for Comelit intercoms",
+});

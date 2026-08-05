@@ -6,11 +6,11 @@ import asyncio
 import contextlib
 import io
 import logging
+import secrets
 import struct
 import time
 from typing import Any
 
-from .const import is_verbose_logging
 from .protocol import HEADER_SIZE, ICONA_BRIDGE_PORT
 
 _LOGGER = logging.getLogger(__name__)
@@ -44,10 +44,7 @@ class _UdpProtocol(asyncio.DatagramProtocol):
         self._receiver = receiver
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        if is_verbose_logging():
-            _LOGGER.debug(
-                "UDP socket connected: %s", transport.get_extra_info("sockname")
-            )
+        _LOGGER.debug("UDP socket connected: %s", transport.get_extra_info("sockname"))
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         self._receiver._on_udp_packet(data)
@@ -57,8 +54,7 @@ class _UdpProtocol(asyncio.DatagramProtocol):
 
     def connection_lost(self, exc: Exception | None) -> None:
         if exc:
-            if is_verbose_logging():
-                _LOGGER.debug("UDP connection lost: %s", exc)
+            _LOGGER.debug("UDP connection lost: %s", exc)
 
 
 class RtpReceiver:
@@ -100,7 +96,7 @@ class RtpReceiver:
         # is the authoritative frame PTS.  PyAV's local decode path ignores
         # it (reads only the bytes), but the RTSP server forwards it.
         self._codec_context = None
-        self._decode_task: asyncio.Task | None = None
+        self._decode_task: asyncio.Task[None] | None = None
         self._nal_queue: asyncio.Queue[tuple[int, bytes]] = asyncio.Queue(maxsize=500)
 
         # Optional fanout queues for RTSP server (attached via attach_rtsp_queues).
@@ -111,6 +107,9 @@ class RtpReceiver:
         # RTP pass-through queue: raw video RTP packets forwarded directly
         # to the RTSP server, bypassing NAL reassembly + re-fragmentation.
         self._rtsp_rtp_queue: asyncio.Queue[bytes] | None = None
+        # Backchannel queue: PCMA payloads received from go2rtc mic input.
+        # When set, _audio_send_loop prefers frames from this queue over silence.
+        self._backchannel_queue: asyncio.Queue[bytes] | None = None
 
         # Audio packet counter (for logging/stats)
         self._audio_packet_count = 0
@@ -124,7 +123,10 @@ class RtpReceiver:
         self._media_packet_count = 0
         self._udp_media_packet_count = 0
         self._tcp_media_packet_count = 0
-        self._keepalive_task: asyncio.Task | None = None
+        self._keepalive_task: asyncio.Task[None] | None = None
+        self._audio_sender_task: asyncio.Task[None] | None = None
+        self._audio_sender_req_id: int = 0
+        self._audio_sent_count: int = 0
 
         # Fires as soon as the first video NAL has been queued — callers can
         # await this to know that video is actually flowing before reporting
@@ -162,10 +164,18 @@ class RtpReceiver:
         self._rtsp_nal_queue = nal_queue
         self._rtsp_audio_queue = audio_queue
         self._rtsp_rtp_queue = rtp_queue
-        if is_verbose_logging():
-            _LOGGER.debug(
-                "RTSP queues attached (rtp_passthrough=%s)", rtp_queue is not None
-            )
+        _LOGGER.debug(
+            "RTSP queues attached (rtp_passthrough=%s)", rtp_queue is not None
+        )
+
+    def attach_backchannel_queue(self, queue: asyncio.Queue[bytes]) -> None:
+        """Attach the RTSP server's backchannel queue for mic audio input.
+
+        When set, _audio_send_loop sends frames from this queue to the device
+        instead of silence, enabling two-way audio via go2rtc.
+        """
+        self._backchannel_queue = queue
+        _LOGGER.debug("Backchannel queue attached")
 
     async def start_control(self) -> int:
         """Open UDP socket and send 2 discovery packets.
@@ -186,28 +196,90 @@ class RtpReceiver:
 
         self._send_control()
         self._send_control()
-        if is_verbose_logging():
-            _LOGGER.debug(
-                "UDP socket ready: local port %d -> %s:%d (control=0x%04X, token=0x%04X)",
-                actual_port,
-                self._host,
-                self._port,
-                self._control_req_id,
-                self._udpm_token,
-            )
+        _LOGGER.debug(
+            "UDP socket ready: local port %d -> %s:%d (control=0x%04X, token=0x%04X)",
+            actual_port,
+            self._host,
+            self._port,
+            self._control_req_id,
+            self._udpm_token,
+        )
         return actual_port
 
     def start_keepalive(self) -> None:
         """Start the continuous keepalive loop (call after video config sent)."""
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
-        if is_verbose_logging():
-            _LOGGER.debug("UDP keepalive loop started")
+        _LOGGER.debug("UDP keepalive loop started")
+
+    def start_audio_sender(self, device_rtpc_req_id: int) -> None:
+        """Start sending blank PCMA audio frames to the device.
+
+        Uses the req_id from the device's own RTPC channel open in the ICONA
+        header (captured after the device opens its RTPC post-video-config).
+        Sends 160-byte G.711 A-law silence at 20 ms intervals (8 kHz, PT=8).
+        Callers can replace silence with real audio in a future implementation
+        by writing to an injected queue; for now blank frames keep the audio
+        path alive even when no microphone source is available.
+        """
+        if self._audio_sender_task and not self._audio_sender_task.done():
+            if self._audio_sender_req_id == device_rtpc_req_id:
+                _LOGGER.debug("Audio sender already running — skipping duplicate start")
+                return
+            self._audio_sender_task.cancel()
+        self._audio_sender_req_id = device_rtpc_req_id
+        self._audio_sender_task = asyncio.create_task(
+            self._audio_send_loop(device_rtpc_req_id)
+        )
+        _LOGGER.debug(
+            "Audio sender started (device_rtpc_req_id=0x%04X)", device_rtpc_req_id
+        )
+
+    async def _audio_send_loop(self, device_rtpc_req_id: int) -> None:
+        """Send PCMA audio frames every 20 ms on the existing UDP socket.
+
+        When a backchannel queue is attached (go2rtc mic audio), real frames
+        are sent; otherwise silence (0xD5) fills each 20 ms slot.
+        """
+        ssrc = secrets.randbelow(0x100000000)
+        seq = 0
+        ts = 0
+        _SILENCE = bytes([0xD5] * 160)  # G.711 A-law silence (near-zero signal)
+        _BODY_LEN = 12 + 160  # 12-byte RTP header + 160-byte payload
+        icona_prefix = struct.pack(
+            "<BBHH2s", 0x00, 0x06, _BODY_LEN, device_rtpc_req_id, b"\x00\x00"
+        )
+        try:
+            while self._running:
+                payload = _SILENCE
+                if self._backchannel_queue is not None:
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        payload = self._backchannel_queue.get_nowait()
+                rtp_header = struct.pack(
+                    ">BBHII",
+                    0x80,  # V=2, P=0, X=0, CC=0
+                    0x08,  # M=0, PT=8 (PCMA G.711 A-law)
+                    seq & 0xFFFF,
+                    ts & 0xFFFFFFFF,
+                    ssrc,
+                )
+                if self._transport:
+                    self._transport.sendto(icona_prefix + rtp_header + payload[:160])
+                    self._audio_sent_count += 1
+                seq += 1
+                ts = (ts + 160) & 0xFFFFFFFF
+                await asyncio.sleep(0.020)
+        except asyncio.CancelledError:
+            pass
+
+    @property
+    def audio_sent_count(self) -> int:
+        """Number of outbound PCMA audio frames sent to the device."""
+        return self._audio_sent_count
 
     def set_media_req_id(self, media_req_id: int) -> None:
         """Set the media request ID once RTPC2 is opened."""
         self._media_req_id = media_req_id
-        if is_verbose_logging():
-            _LOGGER.debug("Media req_id set to 0x%04X", media_req_id)
+        _LOGGER.debug("Media req_id set to 0x%04X", media_req_id)
 
     async def start_media(self) -> None:
         """Start the decode task for processing H.264 NAL units.
@@ -216,8 +288,7 @@ class RtpReceiver:
         sending video data.
         """
         self._decode_task = asyncio.create_task(self._decode_loop())
-        if is_verbose_logging():
-            _LOGGER.debug("H.264 decode task started")
+        _LOGGER.debug("H.264 decode task started")
 
     async def start(self) -> int:
         """Start full receiver (control + media). Legacy one-step API."""
@@ -233,8 +304,7 @@ class RtpReceiver:
             self._control_req_id, self._udpm_token, self._control_seq
         )
         self._transport.sendto(pkt)
-        if is_verbose_logging():
-            _LOGGER.debug("Sent UDP control packet seq=%d", self._control_seq)
+        _LOGGER.debug("Sent UDP control packet seq=%d", self._control_seq)
         self._control_seq += 1
 
     async def _keepalive_loop(self) -> None:
@@ -261,10 +331,9 @@ class RtpReceiver:
         self._media_packet_count += 1
         self._tcp_media_packet_count += 1
         if self._tcp_media_packet_count == 1:
-            if is_verbose_logging():
-                _LOGGER.info(
-                    "Media transport = TCP (RTPC2): first packet %d bytes", len(data)
-                )
+            _LOGGER.info(
+                "Media transport = TCP (RTPC2): first packet %d bytes", len(data)
+            )
         self._process_rtp(data)
 
     def _on_udp_packet(self, data: bytes) -> None:
@@ -282,19 +351,17 @@ class RtpReceiver:
             self._media_packet_count += 1
             self._udp_media_packet_count += 1
             if self._udp_media_packet_count == 1:
-                if is_verbose_logging():
-                    _LOGGER.info(
-                        "Media transport = UDP: first packet %d bytes RTP",
-                        len(raw_rtp),
-                    )
+                _LOGGER.info(
+                    "Media transport = UDP: first packet %d bytes RTP",
+                    len(raw_rtp),
+                )
 
             # Parse RTP header and extract NAL units
             if len(raw_rtp) >= 13:
                 self._process_rtp(raw_rtp)
 
         elif req_id == self._control_req_id:
-            if is_verbose_logging():
-                _LOGGER.debug("Received UDP control response (%d bytes)", len(data))
+            _LOGGER.debug("Received UDP control response (%d bytes)", len(data))
 
     def _process_rtp(self, rtp: bytes) -> None:
         """Parse RTP packet — route to audio or H.264 pipeline by payload type."""
@@ -337,34 +404,7 @@ class RtpReceiver:
             nal_bytes = b"\x00\x00\x00\x01" + nal_data
             self._queue_nal(rtp_ts, nal_bytes)
         elif nal_type == 28:
-            # FU-A fragmented NAL unit
-            if len(nal_data) < 2:
-                return
-            fu_indicator = nal_data[0]
-            fu_header = nal_data[1]
-            start_bit = (fu_header >> 7) & 1
-            end_bit = (fu_header >> 6) & 1
-            frag_type = fu_header & 0x1F
-            nal_ref = fu_indicator & 0xE0
-
-            if start_bit:
-                # Start of fragmented NAL — reconstruct NAL header.
-                # All fragments of a single NAL share the same RTP timestamp,
-                # so we remember it from the first fragment.
-                reconstructed = bytes([nal_ref | frag_type])
-                self._current_fua_nal = bytearray(
-                    b"\x00\x00\x00\x01" + reconstructed + nal_data[2:]
-                )
-                self._current_fua_ts = rtp_ts
-                if frag_type == 5:
-                    self._log_idr_arrival(rtp_ts)
-            elif self._current_fua_nal:
-                # Continuation fragment
-                self._current_fua_nal.extend(nal_data[2:])
-
-            if end_bit and self._current_fua_nal:
-                self._queue_nal(self._current_fua_ts, bytes(self._current_fua_nal))
-                self._current_fua_nal = bytearray()
+            self._process_fua(nal_data, rtp_ts)
         elif 1 <= nal_type <= 23:
             # Other single NAL unit (IDR=5, non-IDR=1, etc.)
             if nal_type == 5:
@@ -372,13 +412,43 @@ class RtpReceiver:
             nal_bytes = b"\x00\x00\x00\x01" + nal_data
             self._queue_nal(rtp_ts, nal_bytes)
 
+    def _process_fua(self, nal_data: bytes, rtp_ts: int) -> None:
+        """Reassemble an H.264 FU-A fragmented NAL unit."""
+        if len(nal_data) < 2:
+            return
+        fu_indicator = nal_data[0]
+        fu_header = nal_data[1]
+        start_bit = (fu_header >> 7) & 1
+        end_bit = (fu_header >> 6) & 1
+        frag_type = fu_header & 0x1F
+        nal_ref = fu_indicator & 0xE0
+
+        if start_bit:
+            # Start of fragmented NAL — reconstruct NAL header.
+            # All fragments of a single NAL share the same RTP timestamp,
+            # so we remember it from the first fragment.
+            reconstructed = bytes([nal_ref | frag_type])
+            self._current_fua_nal = bytearray(
+                b"\x00\x00\x00\x01" + reconstructed + nal_data[2:]
+            )
+            self._current_fua_ts = rtp_ts
+            if frag_type == 5:
+                self._log_idr_arrival(rtp_ts)
+        elif self._current_fua_nal:
+            # Continuation fragment
+            self._current_fua_nal.extend(nal_data[2:])
+
+        if end_bit and self._current_fua_nal:
+            self._queue_nal(self._current_fua_ts, bytes(self._current_fua_nal))
+            self._current_fua_nal = bytearray()
+
     def _process_audio_rtp(self, rtp: bytes, payload_type: int) -> None:
         """Extract raw G.711 audio payload and push to RTSP fanout queue."""
         audio_payload = rtp[12:]  # Skip 12-byte RTP header
         if not audio_payload:
             return
         self._audio_packet_count += 1
-        if is_verbose_logging() and self._audio_packet_count <= 3:
+        if _LOGGER.isEnabledFor(logging.DEBUG) and self._audio_packet_count <= 3:
             _LOGGER.debug(
                 "Audio RTP: PT=%d (%s), %d bytes payload",
                 payload_type,
@@ -403,13 +473,12 @@ class RtpReceiver:
         self._idr_count += 1
         interval = now - self._last_idr_mono if self._last_idr_mono is not None else 0.0
         self._last_idr_mono = now
-        if is_verbose_logging():
-            _LOGGER.debug(
-                "IDR #%d rtp_ts=0x%08X interval=%.2fs",
-                self._idr_count,
-                rtp_ts,
-                interval,
-            )
+        _LOGGER.debug(
+            "IDR #%d rtp_ts=0x%08X interval=%.2fs",
+            self._idr_count,
+            rtp_ts,
+            interval,
+        )
 
     def _queue_nal(self, rtp_ts: int, nal_bytes: bytes) -> None:
         """Queue a complete NAL unit for decoding and optional RTSP fanout.
@@ -438,9 +507,7 @@ class RtpReceiver:
 
     def _maybe_log_drops(self) -> None:
         """Log queue drop counters at most once every 5 seconds."""
-        import time as _time
-
-        now = _time.monotonic()
+        now = time.monotonic()
         if now - self._last_drop_log_mono < 5.0:
             return
         self._last_drop_log_mono = now
@@ -451,18 +518,14 @@ class RtpReceiver:
             self._rtsp_audio_drops,
         )
 
-    async def wait_for_first_video(self, timeout: float) -> bool:
+    async def wait_for_first_video(self) -> None:
         """Wait until the first H.264 NAL has been queued.
 
-        Returns True if video arrived within the timeout, False otherwise.
         Callers use this as a readiness gate before reporting the stream
-        as ready to the user.
+        as ready to the user. Callers manage their own timeout via
+        asyncio.timeout().
         """
-        try:
-            await asyncio.wait_for(self._first_video_nal_event.wait(), timeout=timeout)
-            return True
-        except TimeoutError:
-            return False
+        await self._first_video_nal_event.wait()
 
     @property
     def udp_media_packet_count(self) -> int:
@@ -485,7 +548,7 @@ class RtpReceiver:
 
         def _init_codec() -> tuple[Any, Any]:
             """Import PyAV and create H.264 codec context (runs in thread)."""
-            import av
+            import av  # deferred: loading ffmpeg C lib blocks event loop on aarch64
 
             return av, av.CodecContext.create("h264", "r")
 
@@ -501,36 +564,7 @@ class RtpReceiver:
         frame_count = 0
         consecutive_errors = 0
 
-        verbose = is_verbose_logging()
-
-        def _decode_buffer_sync(buf: bytes) -> list[tuple[int, int, bytes]]:
-            """Parse + decode + JPEG-encode a buffer. Runs in thread pool.
-
-            Returns list of (width, height, jpeg_bytes) tuples — one per
-            decoded frame. Runs blocking C calls off the event loop so the
-            asyncio slow-task detector is not triggered.
-            """
-            import time as _time
-
-            results = []
-            t0 = _time.monotonic() if verbose else 0.0
-            packets = codec.parse(buf)
-            t1 = _time.monotonic() if verbose else 0.0
-            for packet in packets:
-                for frame in codec.decode(packet):
-                    t2 = _time.monotonic() if verbose else 0.0
-                    jpeg = RtpReceiver._frame_to_jpeg(frame)
-                    if jpeg:
-                        results.append((frame.width, frame.height, jpeg))
-                        if verbose:
-                            _LOGGER.debug(
-                                "Decode timing: parse=%.3fs decode=%.3fs jpeg=%.3fs size=%d",
-                                t1 - t0,
-                                t2 - t1,
-                                _time.monotonic() - t2,
-                                len(jpeg),
-                            )
-            return results
+        verbose = _LOGGER.isEnabledFor(logging.DEBUG)
 
         try:
             while self._running:
@@ -551,7 +585,12 @@ class RtpReceiver:
                     h264_buffer.clear()
                     try:
                         decoded = await loop.run_in_executor(
-                            None, _decode_buffer_sync, buf_snapshot
+                            None,
+                            self._sync_decode_buffer,
+                            codec,
+                            av,
+                            buf_snapshot,
+                            verbose,
                         )
                         for w, h, jpeg_data in decoded:
                             frame_count += 1
@@ -592,6 +631,36 @@ class RtpReceiver:
         )
 
     @staticmethod
+    def _sync_decode_buffer(
+        codec: Any, av: Any, buf: bytes, verbose: bool
+    ) -> list[tuple[int, int, bytes]]:
+        """Parse + decode + JPEG-encode a buffer. Runs in thread pool.
+
+        Returns list of (width, height, jpeg_bytes) tuples — one per decoded
+        frame. Runs blocking C calls off the event loop so the asyncio
+        slow-task detector is not triggered.
+        """
+        results = []
+        t0 = time.monotonic() if verbose else 0.0
+        packets = codec.parse(buf)
+        t1 = time.monotonic() if verbose else 0.0
+        for packet in packets:
+            for frame in codec.decode(packet):
+                t2 = time.monotonic() if verbose else 0.0
+                jpeg = RtpReceiver._frame_to_jpeg(frame)
+                if jpeg:
+                    results.append((frame.width, frame.height, jpeg))
+                    if verbose:
+                        _LOGGER.debug(
+                            "Decode timing: parse=%.3fs decode=%.3fs jpeg=%.3fs size=%d",
+                            t1 - t0,
+                            t2 - t1,
+                            time.monotonic() - t2,
+                            len(jpeg),
+                        )
+        return results
+
+    @staticmethod
     def _frame_to_jpeg(frame: Any) -> bytes | None:
         """Convert a PyAV VideoFrame to JPEG bytes via Pillow.
 
@@ -618,7 +687,7 @@ class RtpReceiver:
         """
         self._running = False
 
-        for task_attr in ("_keepalive_task", "_decode_task"):
+        for task_attr in ("_keepalive_task", "_decode_task", "_audio_sender_task"):
             task = getattr(self, task_attr)
             setattr(self, task_attr, None)
             if task and not task.done():
@@ -632,26 +701,22 @@ class RtpReceiver:
         self._protocol = None
 
         self._latest_frame = None
-        if is_verbose_logging():
-            _LOGGER.debug(
-                "RTP receiver stopped (received %d media packets)",
-                self._media_packet_count,
-            )
+        _LOGGER.debug(
+            "RTP receiver stopped (received %d media packets)",
+            self._media_packet_count,
+        )
 
-    async def get_jpeg_frame(self, timeout: float = 5.0) -> bytes | None:
+    async def get_jpeg_frame(self) -> bytes | None:
         """Wait for the next new JPEG frame and return it.
 
         Always waits for the frame event — never returns a cached frame
         immediately. This throttles callers to the device's native fps
         (~16fps) and prevents them from spinning in a tight loop that
         floods the TCP send buffer and causes 10-15s write stalls.
-
-        On timeout, returns the last decoded frame (or None if no frame
-        has ever been decoded) so callers always have something to show.
+        Callers manage their own timeout via asyncio.timeout().
         """
         self._frame_event.clear()
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._frame_event.wait(), timeout=timeout)
+        await self._frame_event.wait()
         return self._latest_frame
 
     @property
