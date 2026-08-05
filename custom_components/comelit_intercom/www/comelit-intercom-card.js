@@ -17,6 +17,7 @@ class ComelitIntercomCard extends HTMLElement {
     this._connected = false;
     this._micEnabled = false;
     this._autoStarted = false;
+    this._failureReason = null;
   }
 
   static getStubConfig() {
@@ -73,7 +74,7 @@ class ComelitIntercomCard extends HTMLElement {
         </div>
         <div class="controls">
           <button id="connect">START CALL</button>
-          <button id="mic" disabled>MIC MUTED</button>
+          <button id="mic" disabled title="Available after the video connection is established">MIC MUTED</button>
           ${doorButtons}
         </div>
       </ha-card>`;
@@ -96,6 +97,10 @@ class ComelitIntercomCard extends HTMLElement {
 
   _refreshIdleState() {
     if (!this.shadowRoot || this._connected || this._pc) return;
+    if (this._failureReason) {
+      this._status(this._failureReason);
+      return;
+    }
     const state = this._cameraState();
     const connect = this.shadowRoot.getElementById("connect");
     if (connect) connect.textContent = this._isInbound() ? "ANSWER CALL" : "START CALL";
@@ -137,6 +142,7 @@ class ComelitIntercomCard extends HTMLElement {
 
   async _connect(withAudio) {
     if (this._pc) return;
+    this._failureReason = null;
     const connect = this.shadowRoot.getElementById("connect");
     connect.disabled = true;
     this._status(withAudio ? "Requesting microphone…" : "Connecting video…");
@@ -167,7 +173,7 @@ class ComelitIntercomCard extends HTMLElement {
         if (!video.srcObject) video.srcObject = new MediaStream();
         video.srcObject.addTrack(event.track);
       };
-      this._pc.onconnectionstatechange = () => {
+      this._pc.onconnectionstatechange = async () => {
         if (!this._pc) return;
         this._status(this._pc.connectionState);
         if (this._pc.connectionState === "connected") {
@@ -176,9 +182,11 @@ class ComelitIntercomCard extends HTMLElement {
           call.disabled = false;
           call.textContent = this._mic ? "END CALL" : "ENABLE AUDIO";
           call.classList.toggle("active", Boolean(this._mic));
-          this.shadowRoot.getElementById("mic").disabled = !this._mic;
+          const mic = this.shadowRoot.getElementById("mic");
+          mic.disabled = !this._mic;
+          mic.title = this._mic ? "Mute or unmute your microphone" : "Enable exterior audio first";
         } else if (["failed", "closed"].includes(this._pc.connectionState)) {
-          this._teardown();
+          await this._fail("Video connection failed. Check the Home Assistant log for details.");
         }
       };
       this._pc.onicecandidate = async (event) => {
@@ -204,8 +212,7 @@ class ComelitIntercomCard extends HTMLElement {
         },
       );
     } catch (error) {
-      this._status(error.message);
-      this._teardown(false);
+      await this._fail(error.message || "Unable to start the intercom session.");
     }
   }
 
@@ -230,7 +237,22 @@ class ComelitIntercomCard extends HTMLElement {
     } else if (message.type === "candidate") {
       await this._pc.addIceCandidate(message.candidate);
     } else if (message.type === "error") {
-      this._status(message.message || message.code);
+      await this._fail(message.message || message.code || "Unable to start the video stream.");
+    }
+  }
+
+  async _fail(reason) {
+    const hadAudio = Boolean(this._mic);
+    this._failureReason = reason;
+    this._teardown(false);
+    this._status(reason);
+    if (hadAudio) {
+      try {
+        await this._setCall(false);
+      } catch (_error) {
+        // Preserve the original WebRTC failure; the backend log has rollback details.
+      }
+      this._status(reason);
     }
   }
 
@@ -253,17 +275,30 @@ class ComelitIntercomCard extends HTMLElement {
     }
     if (this._unsubscribe) this._unsubscribe();
     this._unsubscribe = null;
-    if (this._pc) this._pc.close();
+    const pc = this._pc;
     this._pc = null;
+    if (pc) pc.close();
     if (this._mic) this._mic.getTracks().forEach((track) => track.stop());
     this._mic = null;
     this._sessionId = null;
     this._pendingCandidates = [];
     const mic = this.shadowRoot?.getElementById("mic");
-    if (mic) { mic.disabled = true; mic.textContent = "MIC MUTED"; mic.classList.remove("active"); }
+    if (mic) {
+      mic.disabled = true;
+      mic.textContent = "MIC MUTED";
+      mic.title = "Available after the video connection is established";
+      mic.classList.remove("active");
+    }
     const connect = this.shadowRoot?.getElementById("connect");
-    if (connect) { connect.disabled = false; connect.textContent = "ENABLE AUDIO"; connect.classList.remove("active"); }
-    if (setIdle) this._status("Idle");
+    if (connect) {
+      connect.disabled = false;
+      connect.textContent = this._isInbound() ? "ANSWER CALL" : "START CALL";
+      connect.classList.remove("active");
+    }
+    if (setIdle) {
+      this._failureReason = null;
+      this._status("Idle");
+    }
   }
 
   disconnectedCallback() {

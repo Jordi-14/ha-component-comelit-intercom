@@ -36,7 +36,7 @@ _LOGGER = logging.getLogger(__name__)
 
 VIDEO_RESPONSE_TIMEOUT = 5.0  # device can be slow to respond to CTPP signaling
 VIDEO_SESSION_TIMEOUT = 120.0
-VIDEO_READY_TIMEOUT = 6.0  # max wait for first media packet after signaling
+VIDEO_READY_TIMEOUT = 10.0  # max wait for first media packet after signaling
 
 # CTPP message counter increment constants (from PCAP analysis)
 # Bytes [4-5] in CTPP body encode two independent sub-counters:
@@ -143,6 +143,27 @@ class VideoCallSession:
     def _ts(self) -> int:
         """Return current timestamp for CTPP messages."""
         return int(time.time()) & 0xFFFFFFFF
+
+    @staticmethod
+    async def _require_first_video(receiver: RtpReceiver) -> None:
+        """Wait for real media and fail instead of publishing a black stream."""
+        try:
+            async with asyncio.timeout(VIDEO_READY_TIMEOUT):
+                await receiver.wait_for_first_video()
+        except TimeoutError as err:
+            udp = receiver.udp_media_packet_count
+            tcp = receiver.tcp_media_packet_count
+            _LOGGER.warning(
+                "No media received within %.1fs (udp=%d tcp=%d) — "
+                "signaling succeeded but the device did not send RTP",
+                VIDEO_READY_TIMEOUT,
+                udp,
+                tcp,
+            )
+            raise VideoCallError(
+                translation_domain=DOMAIN,
+                translation_key="video_media_not_received",
+            ) from err
 
     # ------------------------------------------------------------------
     # CTPP signaling helpers (shared by start() and _inline_reestablish)
@@ -509,45 +530,25 @@ class VideoCallSession:
             )
             self._active = True
 
-            # Step 10d: Readiness gate — wait until the first real NAL has
-            # been queued before reporting the session as ready.  Without
-            # this, `Video ready in 1.5s` logs before a single video packet
-            # has arrived and downstream clients see a silent stream.
-            try:
-                async with asyncio.timeout(VIDEO_READY_TIMEOUT):
-                    await receiver.wait_for_first_video()
-                got_media = True
-            except TimeoutError:
-                got_media = False
-            if not got_media:
-                udp = receiver.udp_media_packet_count
-                tcp = receiver.tcp_media_packet_count
-                _LOGGER.warning(
-                    "No media received within %.1fs (udp=%d tcp=%d) — "
-                    "signaling succeeded but device is not sending RTP. "
-                    "Check NAT/firewall for UDP, or firmware may need TCP.",
-                    VIDEO_READY_TIMEOUT,
-                    udp,
-                    tcp,
-                )
-            else:
-                _LOGGER.info(
-                    "Video flowing via %s transport",
-                    "TCP" if receiver.tcp_media_packet_count else "UDP",
-                )
+            # Step 10d: Readiness gate — do not publish an active camera
+            # session until the device has delivered a real video frame.
+            await self._require_first_video(receiver)
+            _LOGGER.info(
+                "Video flowing via %s transport",
+                "TCP" if receiver.tcp_media_packet_count else "UDP",
+            )
 
             # Keep the answer parameters until the user enables exterior audio.
             # Video viewing and answering the call are distinct in the Comelit app.
-            if got_media:
-                self._answer_context = (
-                    client,
-                    ctpp,
-                    our_addr,
-                    entrance_addr,
-                    apt_addr,
-                    call_counter,
-                    media_req_id,
-                )
+            self._answer_context = (
+                client,
+                ctpp,
+                our_addr,
+                entrance_addr,
+                apt_addr,
+                call_counter,
+                media_req_id,
+            )
 
             _LOGGER.debug(
                 "RTP receiver fully started: control=0x%04X, media=0x%04X, udpm_token=0x%04X",
@@ -567,6 +568,9 @@ class VideoCallSession:
             )
             return receiver
 
+        except VideoCallError:
+            await self._cleanup()
+            raise
         except Exception as e:
             await self._cleanup()
             raise VideoCallError(
@@ -661,9 +665,9 @@ class VideoCallSession:
         - 0x0000: keepalive — ACK with bare 0x1800
         - 0x0003 / sub=0x0000: CALL_END — device lease timer expired; perform
             inline re-establishment (same TCP connection, no session restart).
-        - 0x0003 / sub=0x000E: CALL_END triggered by door-open relay activation.
-            PCAP-verified (camera_feed_with_open_door_local.pcap): same renewal
-            sequence as the periodic CALL_END — NOT a bare ACK.
+        - 0x0003 / sub=0x000E: supplemental configuration acknowledgement.
+            Some ICONA firmware sends this every two seconds. It requires a
+            bare ACK; treating it as CALL_END creates an endless renewal loop.
         0x1800 device ACKs are silently ignored.
         """
         try:
@@ -679,8 +683,8 @@ class VideoCallSession:
                 action = struct.unpack_from(">H", resp, 6)[0] if len(resp) >= 8 else 0
                 sub = struct.unpack_from(">H", resp, 8)[0] if len(resp) >= 10 else 0
                 if msg_type == 0x1840:
-                    if action == 0x0003:
-                        # CALL_END (sub=0x0000 = timer, sub=0x000E = door-open triggered)
+                    if action == 0x0003 and sub == 0x0000:
+                        # A zero sub-status is the device lease timer expiring.
                         _LOGGER.debug(
                             "CTPP monitor: CALL_END received (sub=0x%04X) — re-establishing",
                             sub,
