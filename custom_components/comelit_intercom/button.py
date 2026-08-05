@@ -7,6 +7,7 @@ from typing import Any
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -28,11 +29,19 @@ async def async_setup_entry(
     coordinator: ComelitDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
 
     # Create button entities for each door
-    entities = []
+    entities: list[ButtonEntity] = []
     doors = (coordinator.data or {}).get("doors", [])
 
     for door in doors:
         entities.append(ComelitDoorButton(coordinator, door))
+
+    if doors:
+        entities.extend(
+            [
+                ComelitStartVideoButton(coordinator),
+                ComelitStopVideoButton(coordinator),
+            ]
+        )
 
     async_add_entities(entities)
 
@@ -79,3 +88,59 @@ class ComelitDoorButton(CoordinatorEntity[ComelitDataUpdateCoordinator], ButtonE
             control_identity(d) == control_identity(self._door)
             for d in (self.coordinator.data or {}).get("doors", [])
         )
+
+
+class _ComelitVideoButton(
+    CoordinatorEntity[ComelitDataUpdateCoordinator], ButtonEntity
+):
+    """Base class for diagnostic video controls."""
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: ComelitDataUpdateCoordinator) -> None:
+        super().__init__(coordinator)
+        entry_unique_id = coordinator.entry.unique_id or coordinator.host
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry_unique_id)},
+            name=f"Comelit Intercom ({coordinator.host})",
+            manufacturer="Comelit",
+            model="ICONA Bridge",
+        )
+
+    @property
+    def available(self) -> bool:
+        """Return whether the video relay initialized successfully."""
+        return bool(self.coordinator.video_available)
+
+
+class ComelitStartVideoButton(_ComelitVideoButton):
+    """Button that starts the intercom camera stream."""
+
+    _attr_name = "Start video feed"
+    _attr_icon = "mdi:video"
+
+    def __init__(self, coordinator: ComelitDataUpdateCoordinator) -> None:
+        super().__init__(coordinator)
+        entry_unique_id = coordinator.entry.unique_id or coordinator.host
+        self._attr_unique_id = f"{entry_unique_id}_video_start"
+
+    async def async_press(self) -> None:
+        """Start the live video feed."""
+        await self.coordinator.async_start_video()
+
+
+class ComelitStopVideoButton(_ComelitVideoButton):
+    """Button that stops the intercom camera stream."""
+
+    _attr_name = "Stop video feed"
+    _attr_icon = "mdi:video-off"
+
+    def __init__(self, coordinator: ComelitDataUpdateCoordinator) -> None:
+        super().__init__(coordinator)
+        entry_unique_id = coordinator.entry.unique_id or coordinator.host
+        self._attr_unique_id = f"{entry_unique_id}_video_stop"
+
+    async def async_press(self) -> None:
+        """Stop the live video feed."""
+        await self.coordinator.async_stop_video()

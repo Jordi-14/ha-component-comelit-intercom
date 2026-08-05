@@ -8,6 +8,8 @@ This is a native Home Assistant integration for Comelit intercom systems (using 
 - **Automatic token extraction** - no manual token retrieval required (if using default password)
 - Automatic discovery of all available doors and compatible relay/actuator controls
 - Creates button entities for each door and compatible relay/actuator control
+- **Live intercom video in Home Assistant** through a local H.264/RTSP relay
+- Start and stop video controls, with a JPEG preview on the camera entity
 - Simple configuration through Home Assistant UI
 - Works with Comelit intercom models that support the ICONA Bridge protocol
 
@@ -23,7 +25,7 @@ This is a native Home Assistant integration for Comelit intercom systems (using 
 ### HACS Installation (recommended)
 
 1. Ensure you have [HACS](https://hacs.xyz/) installed and set up
-2. Add this repository's URL, `https://github.com/nicolas-fricke/ha-component-comelit-intercom`, as custom repository and select "Integration" (see [docs](https://hacs.xyz/docs/faq/custom_repositories/))
+2. Add this repository's URL, `https://github.com/Jordi-14/ha-component-comelit-intercom`, as custom repository and select "Integration" (see [docs](https://hacs.xyz/docs/faq/custom_repositories/))
 3. Seach for "Comelit Intercom" and click on "Download"
 4. After this is complete, restart Home Assistant
 
@@ -68,6 +70,8 @@ After configuration, the integration will:
 
 You can then:
 - Add door buttons to your dashboard
+- Press `Start video feed`, then open the `Live feed` camera entity to watch the entrance camera
+- Press `Stop video feed` when finished (opening a door stops an active feed before operating the relay)
 - Create automations to open doors based on events
 - Use with voice assistants ("Hey Google, press the front door button")
 - Include in scripts and scenes
@@ -127,6 +131,23 @@ The integration consists of:
 - **config_flow.py**: UI configuration flow with automatic token extraction
 - **coordinator.py**: Data update coordinator for efficient polling
 - **button.py**: Button entities for door control
+- **camera.py**: Home Assistant camera entity backed by the local RTSP relay
+- **video/**: Outbound call signaling, RTP reception, H.264 decoding, and RTSP serving
+
+### Live Video Flow
+
+The built-in entrance camera is not an always-on RTSP endpoint. Starting the
+feed negotiates a local ICONA video call, receives H.264 RTP packets from the
+intercom, and exposes them to Home Assistant at a loopback RTSP URL. No Comelit
+cloud service is used.
+
+The video signaling is based on the PCAP-verified implementation from
+[`antoiba86/hass-comelit-intercom-local`](https://github.com/antoiba86/hass-comelit-intercom-local),
+with additional research from its actively maintained
+[`mnestrud/comelit-man`](https://github.com/mnestrud/comelit-man) fork. It has
+been proven on the Comelit 6701W and uses the same ICONA Bridge channels used by
+this integration. Other models, including the 6741W/6721W, remain device
+testing targets because firmware behavior may vary.
 
 ## Credits
 
@@ -137,6 +158,10 @@ This integration was made possible thanks to:
   - The binary message structure for door operations
   - The channel management system
   - Token extraction methodology
+
+- **[antoiba86's hass-comelit-intercom-local](https://github.com/antoiba86/hass-comelit-intercom-local)** - Apache-2.0-licensed local video signaling, RTP, and RTSP implementation used by the camera feature
+
+- **[mnestrud's comelit-man](https://github.com/mnestrud/comelit-man)** - Continued maintenance, compatibility work, and live-device video validation
 
 - **Protocol Reverse Engineering** - The complex binary protocol for door operations was decoded by analyzing the comelit-client implementation, particularly:
   - The specific byte patterns required for door commands (0x18c0, 0x1800, 0x1820)
@@ -171,6 +196,8 @@ This integration was made possible thanks to:
 - Some Comelit devices may have encrypted backups, preventing automatic token extraction
 - Connection issues on macOS with Python 3.13 (being investigated)
 - Very old firmware versions may use a different protocol
+- Only one ICONA operation runs at a time; configuration polling pauses while video is active
+- Live video is currently receive-only; two-way talk and doorbell events are not exposed
 
 ## Developer Information
 
@@ -187,11 +214,8 @@ For protocol analysis tools and captures, see the original comelit-client reposi
 
 ## License
 
-This project is licensed under the GPL-3.0 License.
-
-## Development Note
-
-This integration was developed primarily using Claude Code (Anthropic's AI assistant). The entire codebase, including protocol reverse engineering, Python implementation, and Home Assistant integration, was written by Claude Code with supervision, testing, and high-level guidance from the maintainer. This approach allowed for rapid development of a complex integration that might have otherwise taken significantly longer to create manually.
+This project is licensed under the GPL-3.0 License. The derived video transport
+under `custom_components/comelit_intercom/video` retains its Apache-2.0 license.
 
 ## Disclaimer
 

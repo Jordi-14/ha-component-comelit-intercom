@@ -1,12 +1,12 @@
 {
   "domain": "comelit_intercom",
   "name": "Comelit Intercom",
-  "codeowners": ["@nicolas-fricke"],
+  "codeowners": ["@nicolas-fricke", "@Jordi-14"],
   "config_flow": true,
-  "dependencies": [],
-  "documentation": "https://github.com/nicolas-fricke/ha-component-comelit-intercom",
+  "dependencies": ["stream"],
+  "documentation": "https://github.com/Jordi-14/ha-component-comelit-intercom",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/nicolas-fricke/ha-component-comelit-intercom/issues",
-  "requirements": ["aiohttp>=3.8.0"],
-  "version": "1.0.2"
+  "issue_tracker": "https://github.com/Jordi-14/ha-component-comelit-intercom/issues",
+  "requirements": ["aiohttp>=3.8.0", "av>=12.0.0"],
+  "version": "1.1.0-beta.1"
 }

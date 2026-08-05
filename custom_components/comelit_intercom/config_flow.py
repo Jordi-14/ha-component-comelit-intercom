@@ -141,7 +141,7 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
         await client.shutdown()
 
 
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg]
     """Handle a config flow for Comelit."""
 
     VERSION = 1

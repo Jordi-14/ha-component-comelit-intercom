@@ -65,8 +65,5 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest pytest-asyncio pytest-cov
           
-      # Note: Add actual tests when available
       - name: Test with pytest
-        run: |
-          echo "No tests yet - skipping"
-          # pytest tests/ --cov=custom_components/comelit_intercom
+        run: pytest -q
