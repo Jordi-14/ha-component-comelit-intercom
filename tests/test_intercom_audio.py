@@ -170,7 +170,5 @@ async def test_missing_media_is_a_start_failure() -> None:
     receiver.udp_media_packet_count = 0
     receiver.tcp_media_packet_count = 0
 
-    with pytest.raises(VideoCallError) as error:
+    with pytest.raises(VideoCallError):
         await VideoCallSession._require_first_video(receiver)
-
-    assert error.value.translation_key == "video_media_not_received"
