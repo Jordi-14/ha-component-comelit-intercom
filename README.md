@@ -1,5 +1,11 @@
 # Comelit Intercom for Home Assistant
 
+[![CI](https://github.com/Jordi-14/ha-component-comelit-intercom/actions/workflows/ci.yaml/badge.svg)](https://github.com/Jordi-14/ha-component-comelit-intercom/actions/workflows/ci.yaml)
+[![HACS Validation](https://github.com/Jordi-14/ha-component-comelit-intercom/actions/workflows/hacs.yaml/badge.svg)](https://github.com/Jordi-14/ha-component-comelit-intercom/actions/workflows/hacs.yaml)
+[![GitHub Release](https://img.shields.io/github/v/release/Jordi-14/ha-component-comelit-intercom)](https://github.com/Jordi-14/ha-component-comelit-intercom/releases)
+[![HACS Custom](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz/)
+[![Home Assistant](https://img.shields.io/badge/Home%20Assistant-2026.5%2B-41BDF5?logo=homeassistant&logoColor=white)](https://www.home-assistant.io/)
+
 This is a native Home Assistant integration for Comelit intercom systems (using the ICONA Bridge protocol). It allows you to control your Comelit doors and compatible relay outputs directly from Home Assistant without requiring MQTT or Docker containers.
 
 ## Features
@@ -18,7 +24,7 @@ This is a native Home Assistant integration for Comelit intercom systems (using 
 
 ## Requirements
 
-- A current Home Assistant release with WebRTC camera support
+- Home Assistant 2026.5.0 or newer
 - Comelit intercom with WiFi connectivity (e.g., Comelit 6741W, 6721W)
 - Comelit device IP address
 - Device must be accessible on port 64100 (ICONA Bridge) and port 8080 (web interface for token extraction)
@@ -29,8 +35,12 @@ This is a native Home Assistant integration for Comelit intercom systems (using 
 
 1. Ensure you have [HACS](https://hacs.xyz/) installed and set up
 2. Add this repository's URL, `https://github.com/Jordi-14/ha-component-comelit-intercom`, as custom repository and select "Integration" (see [docs](https://hacs.xyz/docs/faq/custom_repositories/))
-3. Seach for "Comelit Intercom" and click on "Download"
+3. Search for "Comelit Intercom" and click on "Download"
 4. After this is complete, restart Home Assistant
+
+HACS installs stable releases by default. To test a prerelease, enable beta
+updates for this repository and select the desired version. See
+[Beta Testing](docs/beta_testing.md) before installing a beta.
 
 ### Manual Installation
 
