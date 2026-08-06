@@ -290,7 +290,48 @@ def test_rtsp_is_video_only_until_two_way_audio_is_enabled() -> None:
 
     server.set_audio_enabled(True)
 
-    assert server._build_sdp().count("m=audio") == 2
+    sdp = server._build_sdp()
+    assert sdp.count("m=audio") == 2
+    exterior_audio, microphone = sdp.split("m=audio")[1:]
+    assert "a=recvonly" in exterior_audio
+    assert "a=sendonly" not in exterior_audio
+    assert "a=sendonly" in microphone
+    assert "a=recvonly" not in microphone
+
+
+@pytest.mark.asyncio
+async def test_tcp_media_router_reads_exterior_audio_from_app_rtpc1() -> None:
+    """Panel audio is received on app-opened RTPC1, not panel-opened RTPC."""
+    audio_channel = Channel(
+        name="RTPC",
+        channel_type=ChannelType.UAUT,
+        request_id=1,
+        server_channel_id=2,
+        is_open=True,
+    )
+    video_channel = Channel(
+        name="RTPC2",
+        channel_type=ChannelType.UAUT,
+        request_id=3,
+        server_channel_id=4,
+        is_open=True,
+    )
+    audio_rtp = struct.pack("!BBHII", 0x80, 8, 1, 160, 1234) + b"\xd5" * 160
+    audio_channel.response_queue.put_nowait(audio_rtp)
+    receiver = MagicMock()
+    receiver.running = True
+
+    def receive(data: bytes) -> None:
+        receiver.running = False
+        assert data == audio_rtp
+
+    receiver.receive_tcp_rtp.side_effect = receive
+
+    await VideoCallSession._tcp_media_router(
+        MagicMock(), audio_channel, video_channel, receiver
+    )
+
+    receiver.receive_tcp_rtp.assert_called_once_with(audio_rtp)
 
 
 @pytest.mark.asyncio

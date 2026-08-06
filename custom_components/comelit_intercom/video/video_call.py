@@ -523,7 +523,7 @@ class VideoCallSession:
             # wait are ACKed instead of lingering in the channel buffer.
             self._call_counter = call_counter
             self._tcp_task = asyncio.create_task(
-                self._tcp_inbound_media_router(client, device_rtpc, rtpc2, receiver)
+                self._tcp_media_router(client, rtpc1, rtpc2, receiver)
             )
             self._ctpp_task = asyncio.create_task(
                 self._ctpp_monitor_loop(
@@ -902,12 +902,11 @@ class VideoCallSession:
         if self._tcp_task and not self._tcp_task.done():
             self._tcp_task.cancel()
         if self._rtp_receiver:
+            rtpc1 = client.get_channel("RTPC")
             rtpc2 = client.get_channel("RTPC2")
-            if rtpc2:
+            if rtpc1 and rtpc2:
                 self._tcp_task = asyncio.create_task(
-                    self._tcp_inbound_media_router(
-                        client, device_rtpc, rtpc2, self._rtp_receiver
-                    )
+                    self._tcp_media_router(client, rtpc1, rtpc2, self._rtp_receiver)
                 )
         call_counter = await self._ack_device_rtpc_link(
             client, ctpp, our_addr, entrance_addr, call_counter
@@ -1289,7 +1288,7 @@ class VideoCallSession:
 
             # Step 17: Start TCP media router — device sends video (RTPC2) + audio (RTPC1) via TCP
             self._tcp_task = asyncio.create_task(
-                self._tcp_inbound_media_router(client, rtpc1, rtpc2, receiver)
+                self._tcp_media_router(client, rtpc1, rtpc2, receiver)
             )
             self._call_counter = call_counter
             self._ctpp_task = asyncio.create_task(
@@ -1374,20 +1373,22 @@ class VideoCallSession:
         await self._client.send_binary(channel, rtp_packet)
 
     @staticmethod
-    async def _tcp_inbound_media_router(
+    async def _tcp_media_router(
         client: IconaBridgeClient,
-        rtpc1: Channel,
-        rtpc2: Channel,
+        audio_channel: Channel,
+        video_channel: Channel,
         receiver: RtpReceiver,
     ) -> None:
-        """Route TCP RTP from RTPC1 (audio) and RTPC2 (video) into receiver.
+        """Route TCP RTP from app-opened RTPC1 (audio) and RTPC2 (video).
 
-        On inbound calls the device streams both tracks over TCP (not UDP).
-        The client strips the ICONA header, so queued data is raw RTP.
+        The panel-created RTPC channel is the opposite direction: HA writes
+        microphone RTP to it. Reading that channel instead of the app-opened
+        RTPC1 leaves exterior audio queued forever. The client strips the
+        ICONA header, so queued media is raw RTP.
         """
         try:
             while receiver.running:
-                for ch in (rtpc1, rtpc2):
+                for ch in (audio_channel, video_channel):
                     try:
                         data = ch.response_queue.get_nowait()
                         if len(data) >= 12:

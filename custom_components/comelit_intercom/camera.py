@@ -123,11 +123,15 @@ class ComelitIntercomCamera(Camera):
         session = self._coordinator.video_session
         if not session or not session.active or not session.rtp_receiver:
             return PLACEHOLDER_JPEG
+        receiver = session.rtp_receiver
         try:
             async with asyncio.timeout(2.0):
-                return await session.rtp_receiver.get_jpeg_frame()
+                return await receiver.get_jpeg_frame()
         except TimeoutError:
-            return session.rtp_receiver.latest_frame
+            # A door command can reset the panel connection while this request
+            # waits. The session property is cleared during that reset, so use
+            # the receiver captured before the wait instead of dereferencing it.
+            return receiver.latest_frame
 
     async def async_handle_async_webrtc_offer(
         self,

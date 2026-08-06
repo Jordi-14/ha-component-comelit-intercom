@@ -406,7 +406,8 @@ class LocalRtspServer:
                         f"CSeq: {cseq}\r\n"
                         f"Content-Type: application/sdp\r\n"
                         f"Content-Length: {len(sdp)}\r\n"
-                        f"\r\n".encode() + sdp
+                        f"\r\n".encode()
+                        + sdp
                     )
                     await writer.drain()
 
@@ -632,16 +633,21 @@ class LocalRtspServer:
         )
         if not self._audio_enabled:
             return video_sdp
+        # go2rtc interprets RTSP SDP directions from its client perspective:
+        # recvonly is media received from this relay, while sendonly is the
+        # microphone backchannel it sends to the relay.  Reversing these makes
+        # go2rtc SETUP both tracks successfully but routes each RTP direction
+        # onto the other track, leaving both sides silent.
         return video_sdp + (
             "m=audio 0 RTP/AVP 8\r\n"
             "c=IN IP4 0.0.0.0\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
-            "a=sendonly\r\n"
+            "a=recvonly\r\n"
             "a=control:audio\r\n"
             "m=audio 0 RTP/AVP 8\r\n"
             "c=IN IP4 0.0.0.0\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
-            "a=recvonly\r\n"
+            "a=sendonly\r\n"
             "a=control:backchannel\r\n"
         )
 
@@ -672,9 +678,8 @@ class LocalRtspServer:
                     rtp = await self._readexactly_buffered(
                         reader, request_buffer, length
                     )
-                    if (
-                        channel == client.backchannel_ch
-                        and self._queue_backchannel_rtp(rtp)
+                    if channel == client.backchannel_ch and self._queue_backchannel_rtp(
+                        rtp
                     ):
                         if not client.backchannel_started:
                             client.backchannel_started = True
