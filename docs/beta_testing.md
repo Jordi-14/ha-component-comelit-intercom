@@ -42,6 +42,9 @@ Do not mix files from different releases.
 - Repeated still requests within 15 seconds reuse the cached JPEG.
 - Clicking the camera opens low-latency live video without any separate
   Start/Stop controls.
+- After closing one live view and allowing a dashboard still to refresh,
+  clicking the camera again replaces the still with live video rather than
+  remaining on the cached poster.
 - Closing a WebRTC viewer releases the panel automatically; HLS fallback is
   released by its safety timeout.
 - Test both a browser and the Home Assistant Companion app.

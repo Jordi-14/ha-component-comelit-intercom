@@ -122,7 +122,20 @@ class ComelitIntercomCamera(Camera):
         source = self._coordinator.rtsp_url
         if rtsp_server := self._coordinator.rtsp_server:
             rtsp_server.set_audio_enabled(False)
-        return source
+        if source is None:
+            return None
+
+        # Home Assistant's go2rtc provider keeps producers registered by URL.
+        # A stable URL can therefore reconnect the RTSP socket after a short
+        # snapshot session while leaving a new WebRTC viewer attached to the
+        # old producer (the panel streams, but the browser stays on its poster).
+        # Keep the URL stable within one media session and change it between
+        # sessions so go2rtc replaces the producer for every new live view.
+        separator = "&" if "?" in source else "?"
+        revision = self._coordinator.video_stream_revision
+        live_source = f"{source}{separator}session={revision}"
+        _LOGGER.debug("Live RTSP source revision %d", revision)
+        return live_source
 
     async def async_camera_image(
         self,

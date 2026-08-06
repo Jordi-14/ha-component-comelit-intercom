@@ -68,6 +68,7 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
         self._config: DeviceConfig | None = None
         self._video_session: VideoCallSession | None = None
         self._video_session_purpose: str | None = None
+        self._video_stream_revision = 0
         self._video_stopped_by_user: bool = False
         # Prevents concurrent async_start_video calls from racing each other.
         # The device can only handle one CTPP negotiation at a time; a second
@@ -540,6 +541,7 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
                     )
                 self._video_session = session
                 self._video_session_purpose = purpose
+                self._video_stream_revision += 1
                 # Preserve an unexpected end reason across an automatic
                 # recovery so the card can explain why the previous stream
                 # stopped. A deliberate new view starts with a clean status.
@@ -672,6 +674,7 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 )
             self._video_session = session
             self._video_session_purpose = VIDEO_PURPOSE_INBOUND
+            self._video_stream_revision += 1
             self._last_video_end_reason = None
             self._last_video_end_at = None
             self._video_ready_event.set()
@@ -905,6 +908,11 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
     def video_session_purpose(self) -> str | None:
         """Return whether the current media session serves live video or a still."""
         return self._video_session_purpose
+
+    @property
+    def video_stream_revision(self) -> int:
+        """Return a monotonic identifier for the current media session."""
+        return self._video_stream_revision
 
     def _on_client_disconnect(self) -> None:
         """Called by the TCP client when the connection drops unexpectedly.

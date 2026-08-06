@@ -8,5 +8,5 @@
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/Jordi-14/ha-component-comelit-intercom/issues",
   "requirements": ["aiohttp>=3.8.0", "av>=12.0.0"],
-  "version": "1.2.0b19"
+  "version": "1.2.0b20"
 }

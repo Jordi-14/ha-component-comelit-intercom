@@ -148,6 +148,7 @@ def _camera_coordinator() -> MagicMock:
     coordinator.host = "192.0.2.1"
     coordinator.video_session = None
     coordinator.video_session_purpose = None
+    coordinator.video_stream_revision = 7
     coordinator.rtsp_server = None
     coordinator.rtsp_url = "rtsp://127.0.0.1:12345/intercom"
     return coordinator
@@ -177,7 +178,7 @@ async def test_camera_live_view_starts_without_video_buttons() -> None:
     camera = ComelitIntercomCamera(coordinator)
 
     try:
-        assert await camera.stream_source() == coordinator.rtsp_url
+        assert await camera.stream_source() == f"{coordinator.rtsp_url}?session=7"
     finally:
         camera._cancel_live_stop()
 
@@ -186,6 +187,26 @@ async def test_camera_live_view_starts_without_video_buttons() -> None:
         by_user=True,
         purpose=coordinator_module.VIDEO_PURPOSE_LIVE,
     )
+
+
+@pytest.mark.asyncio
+@requires_homeassistant
+async def test_camera_source_changes_between_panel_sessions() -> None:
+    """A new panel session must replace go2rtc's previous producer."""
+    coordinator = _camera_coordinator()
+    coordinator.video_session = MagicMock(active=True)
+    coordinator.video_session_purpose = coordinator_module.VIDEO_PURPOSE_LIVE
+    camera = ComelitIntercomCamera(coordinator)
+
+    try:
+        first_source = await camera.stream_source()
+        coordinator.video_stream_revision = 8
+        second_source = await camera.stream_source()
+    finally:
+        camera._cancel_live_stop()
+
+    assert first_source == f"{coordinator.rtsp_url}?session=7"
+    assert second_source == f"{coordinator.rtsp_url}?session=8"
 
 
 @pytest.mark.asyncio
