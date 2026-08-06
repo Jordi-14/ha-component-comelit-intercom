@@ -93,14 +93,14 @@ class ComelitIntercomCamera(Camera):
     async def stream_source(self) -> str | None:
         """Return the local RTSP URL once video media is ready."""
         if self.is_streaming:
-            return f"{self._coordinator.rtsp_url}#backchannel=1"
+            return self._coordinator.rtsp_url
         try:
             await asyncio.wait_for(
                 self._coordinator.video_ready_event.wait(), timeout=8.0
             )
         except TimeoutError:
             return None
-        return f"{self._coordinator.rtsp_url}#backchannel=1"
+        return self._coordinator.rtsp_url
 
     async def async_camera_image(
         self,
@@ -132,6 +132,12 @@ class ComelitIntercomCamera(Camera):
                 return
 
         source = await self.stream_source()
+        session = self._coordinator.video_session
+        with_audio = bool(session and session.audio_answered)
+        if rtsp_server := self._coordinator.rtsp_server:
+            rtsp_server.set_audio_enabled(with_audio)
+        if source and with_audio:
+            source = f"{source}#backchannel=1"
         for provider in self.hass.data.get(DATA_WEBRTC_PROVIDERS, set()):
             if source and provider.async_is_supported(source):
                 self._webrtc_sessions[session_id] = provider

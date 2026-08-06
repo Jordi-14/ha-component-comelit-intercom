@@ -192,8 +192,6 @@ class ComelitIntercomCard extends HTMLElement {
       if (this._mic) {
         const track = this._mic.getAudioTracks()[0];
         this._pc.addTransceiver(track, { direction: "sendrecv", streams: [this._mic] });
-      } else {
-        this._pc.addTransceiver("audio", { direction: "recvonly" });
       }
       this._pc.addTransceiver("video", { direction: "recvonly" });
       this._pc.ontrack = (event) => {

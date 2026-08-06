@@ -205,6 +205,43 @@ def test_card_cache_version_matches_integration_version() -> None:
     assert f'CARD_VERSION = "{manifest["version"]}"' in init_source
 
 
+def test_rtsp_is_video_only_until_two_way_audio_is_enabled() -> None:
+    """Normal viewing must retain the first beta's proven video-only SDP."""
+    server = LocalRtspServer()
+
+    assert "m=video" in server._build_sdp()
+    assert "m=audio" not in server._build_sdp()
+
+    server.set_audio_enabled(True)
+
+    assert server._build_sdp().count("m=audio") == 2
+
+
+@pytest.mark.asyncio
+async def test_rtsp_play_waits_for_real_video() -> None:
+    """An idle relay must not create a successfully negotiated black producer."""
+    server = LocalRtspServer()
+    server._running = True
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"PLAY rtsp://127.0.0.1/intercom RTSP/1.0\r\nCSeq: 4\r\n\r\n")
+    writer = MagicMock()
+    writer.get_extra_info.side_effect = lambda name: (
+        ("127.0.0.1", 12345) if name == "peername" else None
+    )
+    writer.drain = AsyncMock()
+
+    play_task = asyncio.create_task(server._handle_client(reader, writer))
+    await asyncio.sleep(0)
+
+    writer.write.assert_not_called()
+
+    server.mark_ready()
+    reader.feed_eof()
+    await asyncio.wait_for(play_task, timeout=1)
+
+    assert b"RTSP/1.0 200 OK" in writer.write.call_args_list[0].args[0]
+
+
 @pytest.mark.asyncio
 async def test_outbound_audio_runs_answer_sequence_before_sender() -> None:
     """An outbound view becomes a call only after audio is explicitly enabled."""

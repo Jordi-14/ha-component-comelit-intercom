@@ -109,6 +109,10 @@ class LocalRtspServer:
         # input (via ANNOUNCE/RECORD).  rtp_receiver reads from this queue
         # to replace silence with real audio in _audio_send_loop.
         self.backchannel_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)
+        # Keep normal viewing identical to the proven first camera beta:
+        # video-only SDP. Audio tracks are advertised only while HA has
+        # explicitly enabled a two-way call.
+        self._audio_enabled = False
 
         # UDP sockets — fallback for clients that request UDP transport
         self._video_sock: socket.socket | None = None
@@ -257,6 +261,10 @@ class LocalRtspServer:
         """Signal that no session is flowing — future PLAYs will stall until ready."""
         self._ready_event.clear()
 
+    def set_audio_enabled(self, enabled: bool) -> None:
+        """Include exterior-audio and microphone tracks in subsequent DESCRIBEs."""
+        self._audio_enabled = enabled
+
     def disconnect_clients(self) -> None:
         """Close all active RTSP client connections to force immediate reconnect.
 
@@ -396,7 +404,8 @@ class LocalRtspServer:
                         f"CSeq: {cseq}\r\n"
                         f"Content-Type: application/sdp\r\n"
                         f"Content-Length: {len(sdp)}\r\n"
-                        f"\r\n".encode() + sdp
+                        f"\r\n".encode()
+                        + sdp
                     )
                     await writer.drain()
 
@@ -419,6 +428,24 @@ class LocalRtspServer:
                     )
 
                 elif method == "PLAY":
+                    # Do not let go2rtc bind a producer to an idle relay. The
+                    # first camera beta waited here until real Comelit RTP was
+                    # flowing; removing that gate caused clients to negotiate
+                    # successfully but retain a black video track.
+                    if not self._ready_event.is_set():
+                        _LOGGER.debug(
+                            "PLAY from %s waiting for video readiness", client_host
+                        )
+                        try:
+                            await asyncio.wait_for(
+                                self._ready_event.wait(), timeout=10.0
+                            )
+                        except TimeoutError:
+                            writer.write(
+                                f"RTSP/1.0 503 Service Unavailable\r\nCSeq: {cseq}\r\n\r\n".encode()
+                            )
+                            await writer.drain()
+                            break
                     self._send(
                         writer,
                         cseq,
@@ -561,7 +588,7 @@ class LocalRtspServer:
         pps_b64 = base64.b64encode(self._latest_pps).decode()
         # profile-level-id = first 3 bytes of SPS (profile_idc, constraints, level_idc)
         profile_level_id = self._latest_sps[1:4].hex()
-        return (
+        video_sdp = (
             "v=0\r\n"
             f"o=- 0 0 IN IP4 {self._bind_host}\r\n"
             "s=Comelit Intercom\r\n"
@@ -573,6 +600,10 @@ class LocalRtspServer:
             f"profile-level-id={profile_level_id};"
             f"sprop-parameter-sets={sps_b64},{pps_b64}\r\n"
             "a=control:video\r\n"
+        )
+        if not self._audio_enabled:
+            return video_sdp
+        return video_sdp + (
             "m=audio 0 RTP/AVP 8\r\n"
             "c=IN IP4 0.0.0.0\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
@@ -605,9 +636,8 @@ class LocalRtspServer:
                     channel = header[0]
                     length = struct.unpack("!H", header[1:3])[0]
                     rtp = await reader.readexactly(length)
-                    if (
-                        channel == client.backchannel_ch
-                        and self._queue_backchannel_rtp(rtp)
+                    if channel == client.backchannel_ch and self._queue_backchannel_rtp(
+                        rtp
                     ):
                         if not client.backchannel_started:
                             client.backchannel_started = True
