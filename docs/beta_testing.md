@@ -34,8 +34,9 @@ Do not mix files from different releases.
 - Existing door entities and entity IDs remain unchanged.
 - Every configured door has a separate working button.
 - Opening the bundled card starts video without enabling exterior audio.
-- Receive-only video works in browsers and the Companion app through HA's HLS
-  path, including through HTTP-only remote tunnels.
+- Receive-only video prefers low-latency WebRTC in browsers and the Companion
+  app, falls back to HLS within eight seconds when necessary, and never requires
+  separate start/stop controls.
 - The exterior-audio switch enables and ends the audio call.
 - The microphone starts muted and its toggle works in both a browser and the
   Home Assistant Companion app.

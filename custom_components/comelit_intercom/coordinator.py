@@ -380,9 +380,13 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
             raise RuntimeError("Not connected")
         if self._video_session and self._video_session.active:
             our_addr = f"{self._config.apt_address}{self._config.apt_subaddress}"
-            entrance_addr = self._config.caller_address or our_addr
+            # A system can expose multiple controls with the same relay index
+            # on different entrance panels.  The active-call command carries
+            # both the relay and its panel address; using the first configured
+            # entrance for every button made those controls indistinguishable.
+            entrance_addr = door.apt_address or self._config.caller_address or our_addr
             await self._video_session.async_open_door_on_ctpp(
-                our_addr, entrance_addr, door.output_index
+                our_addr, entrance_addr, door.output_index, door.name
             )
         else:
             try:

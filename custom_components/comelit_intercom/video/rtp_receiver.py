@@ -9,6 +9,7 @@ import logging
 import secrets
 import struct
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .const import is_verbose_logging
@@ -127,6 +128,7 @@ class RtpReceiver:
         self._keepalive_task: asyncio.Task[None] | None = None
         self._audio_sender_task: asyncio.Task[None] | None = None
         self._audio_sender_req_id: int = 0
+        self._audio_tcp_sender: Callable[[bytes], Awaitable[None]] | None = None
         self._audio_sent_count: int = 0
 
         # Fires as soon as the first video NAL has been queued — callers can
@@ -212,27 +214,32 @@ class RtpReceiver:
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
         _LOGGER.debug("UDP keepalive loop started")
 
-    def start_audio_sender(self, device_rtpc_req_id: int) -> None:
-        """Start sending blank PCMA audio frames to the device.
+    def start_audio_sender(
+        self,
+        device_rtpc_req_id: int,
+        tcp_sender: Callable[[bytes], Awaitable[None]] | None = None,
+    ) -> None:
+        """Start sending PCMA audio frames to the device.
 
-        Uses the req_id from the device's own RTPC channel open in the ICONA
-        header (captured after the device opens its RTPC post-video-config).
-        Sends 160-byte G.711 A-law silence at 20 ms intervals (8 kHz, PT=8).
-        Callers can replace silence with real audio in a future implementation
-        by writing to an injected queue; for now blank frames keep the audio
-        path alive even when no microphone source is available.
+        The panel opens an RTPC channel for app-to-panel audio.  When media is
+        negotiated over TCP, ``tcp_sender`` writes RTP on that channel.  The
+        UDP fallback is retained for firmware which actually chooses UDP.
         """
         if self._audio_sender_task and not self._audio_sender_task.done():
             if self._audio_sender_req_id == device_rtpc_req_id:
+                self._audio_tcp_sender = tcp_sender
                 _LOGGER.debug("Audio sender already running — skipping duplicate start")
                 return
             self._audio_sender_task.cancel()
         self._audio_sender_req_id = device_rtpc_req_id
+        self._audio_tcp_sender = tcp_sender
         self._audio_sender_task = asyncio.create_task(
             self._audio_send_loop(device_rtpc_req_id)
         )
         _LOGGER.debug(
-            "Audio sender started (device_rtpc_req_id=0x%04X)", device_rtpc_req_id
+            "Audio sender started (device_rtpc_req_id=0x%04X, transport=%s)",
+            device_rtpc_req_id,
+            "TCP" if tcp_sender else "UDP",
         )
 
     async def _audio_send_loop(self, device_rtpc_req_id: int) -> None:
@@ -263,14 +270,20 @@ class RtpReceiver:
                     ts & 0xFFFFFFFF,
                     ssrc,
                 )
-                if self._transport:
-                    self._transport.sendto(icona_prefix + rtp_header + payload[:160])
+                rtp_packet = rtp_header + payload[:160]
+                if self._audio_tcp_sender is not None:
+                    await self._audio_tcp_sender(rtp_packet)
+                    self._audio_sent_count += 1
+                elif self._transport:
+                    self._transport.sendto(icona_prefix + rtp_packet)
                     self._audio_sent_count += 1
                 seq += 1
                 ts = (ts + 160) & 0xFFFFFFFF
                 await asyncio.sleep(0.020)
         except asyncio.CancelledError:
             pass
+        except Exception:
+            _LOGGER.warning("Panel audio sender stopped unexpectedly", exc_info=True)
 
     @property
     def audio_sent_count(self) -> int:

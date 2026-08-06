@@ -21,6 +21,7 @@ class ComelitIntercomCard extends HTMLElement {
     this._failureReason = null;
     this._videoLoaded = false;
     this._connectionTimer = null;
+    this._nativeFallbackTimer = null;
   }
 
   static getStubConfig() {
@@ -62,8 +63,9 @@ class ComelitIntercomCard extends HTMLElement {
     this.shadowRoot.innerHTML = `
       <style>
         ha-card { overflow: hidden; }
-        .video { position: relative; aspect-ratio: 4 / 3; background: #000; }
+        .video { position: relative; aspect-ratio: 5 / 3; background: #000; }
         #native-stream, #native-stream > * { width: 100%; height: 100%; display: block; }
+        #native-stream > * { --video-max-height: 100%; }
         #call-video { width: 100%; height: 100%; object-fit: contain; }
         [hidden] { display: none !important; }
         audio { display: none; }
@@ -114,46 +116,52 @@ class ComelitIntercomCard extends HTMLElement {
 
     this._mountingNativeStream = true;
     try {
-      // Use HA's official HLS player explicitly for receive-only viewing.
-      // WebRTC media cannot traverse common HTTP-only remote tunnels, while
-      // HLS stays on HA's authenticated HTTP path in browsers and apps.
-      // Two-way calls switch to the WebRTC player below because a microphone
-      // backchannel fundamentally requires a bidirectional real-time route.
+      // Prefer HA's official WebRTC player for low-latency viewing. If the
+      // current browser/app cannot establish a media route, switch to HLS on
+      // HA's authenticated HTTP path instead of leaving a black player.
       if (!window.loadCardHelpers) {
         throw new Error("Home Assistant's card helpers are unavailable");
       }
       const helpers = await window.loadCardHelpers();
       const container = this.shadowRoot?.getElementById("native-stream");
       if (!container) return;
-      // The picture card prefers WebRTC and waits 30 seconds before giving
-      // up when ICE is unreachable. ha-hls-player is the supported HA player
-      // for forcing the HTTP fallback without maintaining our own hls.js.
       // Creating (but not mounting) HA's picture card loads the camera-player
-      // module on frontend versions where ha-hls-player is lazy-loaded.
+      // modules on frontend versions where the players are lazy-loaded.
       await helpers.createCardElement({
         type: "picture-entity",
         entity: this._config.entity,
       });
-      await customElements.whenDefined("ha-hls-player");
-      const stream = document.createElement("ha-hls-player");
+      await Promise.all([
+        customElements.whenDefined("ha-web-rtc-player"),
+        customElements.whenDefined("ha-hls-player"),
+      ]);
+      const stream = document.createElement("ha-web-rtc-player");
       stream.hass = this._hass;
       stream.entityid = this._config.entity;
       stream.autoPlay = true;
       stream.playsInline = true;
       stream.muted = true;
-      stream.allowExoPlayer = true;
       stream.addEventListener("load", () => {
+        clearTimeout(this._nativeFallbackTimer);
+        this._nativeFallbackTimer = null;
         this._status(this._failureReason || "Live");
       });
       stream.addEventListener("streams", (event) => {
         if (event.detail?.hasVideo === false) {
-          this._status("Live video unavailable; showing the latest image");
+          this._mountHlsStream("WebRTC unavailable; using compatible live video…");
         } else if (event.detail?.hasVideo) {
+          clearTimeout(this._nativeFallbackTimer);
+          this._nativeFallbackTimer = null;
           this._status(this._failureReason || "Live");
         }
       });
       container.replaceChildren(stream);
       this._nativeStream = stream;
+      this._nativeFallbackTimer = setTimeout(() => {
+        if (this._nativeStream === stream && !this._pc) {
+          this._mountHlsStream("WebRTC unavailable; using compatible live video…");
+        }
+      }, 8000);
       if (!this._failureReason) this._status("Connecting video…");
     } catch (error) {
       this._status(error.message || "Unable to load Home Assistant's camera player");
@@ -162,7 +170,35 @@ class ComelitIntercomCard extends HTMLElement {
     }
   }
 
+  _mountHlsStream(statusText) {
+    if (!this._hass || !this._config || this._pc) return;
+    const container = this.shadowRoot?.getElementById("native-stream");
+    if (!container) return;
+    clearTimeout(this._nativeFallbackTimer);
+    this._nativeFallbackTimer = null;
+    const stream = document.createElement("ha-hls-player");
+    stream.hass = this._hass;
+    stream.entityid = this._config.entity;
+    stream.autoPlay = true;
+    stream.playsInline = true;
+    stream.muted = true;
+    stream.allowExoPlayer = true;
+    stream.addEventListener("load", () => {
+      this._status(this._failureReason || "Live (compatible mode)");
+    });
+    stream.addEventListener("streams", (event) => {
+      if (event.detail?.hasVideo === false) {
+        this._status("Live video unavailable; showing the latest image");
+      }
+    });
+    container.replaceChildren(stream);
+    this._nativeStream = stream;
+    if (statusText) this._status(statusText);
+  }
+
   _removeNativeStream() {
+    clearTimeout(this._nativeFallbackTimer);
+    this._nativeFallbackTimer = null;
     this._nativeStream?.remove();
     this._nativeStream = null;
     const container = this.shadowRoot?.getElementById("native-stream");

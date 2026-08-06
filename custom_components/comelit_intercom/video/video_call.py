@@ -896,7 +896,9 @@ class VideoCallSession:
         self._device_rtpc_req_id = device_rtpc.server_channel_id
         self._device_rtpc_channel = device_rtpc
         if getattr(self, "_audio_answered", False) and self._rtp_receiver:
-            self._rtp_receiver.start_audio_sender(self._device_rtpc_req_id)
+            self._rtp_receiver.start_audio_sender(
+                self._device_rtpc_req_id, self._send_audio_packet
+            )
         if self._tcp_task and not self._tcp_task.done():
             self._tcp_task.cancel()
         if self._rtp_receiver:
@@ -1340,7 +1342,9 @@ class VideoCallSession:
                 "answer_inbound: no receiver or device RTPC req_id — cannot start audio"
             )
             return
-        self._rtp_receiver.start_audio_sender(self._device_rtpc_req_id)
+        self._rtp_receiver.start_audio_sender(
+            self._device_rtpc_req_id, self._send_audio_packet
+        )
         self._audio_answered = True
         _LOGGER.info(
             "Inbound call answered — audio sender started (req_id=0x%04X)",
@@ -1356,9 +1360,18 @@ class VideoCallSession:
         if not self._rtp_receiver or self._device_rtpc_req_id == 0:
             _LOGGER.warning("No device audio channel is available")
             return
-        self._rtp_receiver.start_audio_sender(self._device_rtpc_req_id)
+        self._rtp_receiver.start_audio_sender(
+            self._device_rtpc_req_id, self._send_audio_packet
+        )
         self._audio_answered = True
         _LOGGER.info("Two-way audio enabled (req_id=0x%04X)", self._device_rtpc_req_id)
+
+    async def _send_audio_packet(self, rtp_packet: bytes) -> None:
+        """Send microphone RTP on the RTPC transport opened by the panel."""
+        channel = self._device_rtpc_channel
+        if channel is None or not channel.is_open:
+            raise RuntimeError("The panel audio channel is not open")
+        await self._client.send_binary(channel, rtp_packet)
 
     @staticmethod
     async def _tcp_inbound_media_router(
@@ -1388,7 +1401,11 @@ class VideoCallSession:
             _LOGGER.debug("TCP inbound media router error", exc_info=True)
 
     async def async_open_door_on_ctpp(
-        self, our_addr: str, entrance_addr: str, relay_index: int
+        self,
+        our_addr: str,
+        entrance_addr: str,
+        relay_index: int,
+        door_name: str = "",
     ) -> None:
         """Open a door by sending 0x1840/0x000D on the active video CTPP channel.
 
@@ -1406,7 +1423,9 @@ class VideoCallSession:
             )
             await self._client.send_binary(ctpp, payload)
         _LOGGER.info(
-            "Door open sent on video CTPP (relay=%d, counter=0x%08X)",
+            "Door '%s' open sent on video CTPP (target=%s, relay=%d, counter=0x%08X)",
+            door_name or entrance_addr,
+            entrance_addr,
             relay_index,
             self._call_counter,
         )

@@ -59,6 +59,9 @@ from custom_components.comelit_intercom.video.client import (  # noqa: E402
 from custom_components.comelit_intercom.video.exceptions import (  # noqa: E402
     VideoCallError,
 )
+from custom_components.comelit_intercom.video.rtp_receiver import (  # noqa: E402
+    RtpReceiver,
+)
 from custom_components.comelit_intercom.video.rtsp_server import (  # noqa: E402
     LocalRtspServer,
     _TcpClient,
@@ -185,15 +188,19 @@ def test_card_uses_separate_autoplay_safe_media_elements() -> None:
     assert "video.play().catch" in card
 
 
-def test_card_uses_ha_hls_fallback_and_webrtc_configuration() -> None:
-    """Normal video uses HA HLS; calls use HA's advertised ICE setup."""
+def test_card_uses_low_latency_video_with_hls_fallback() -> None:
+    """Normal video prefers WebRTC but retains an explicit HLS fallback."""
     card = (COMPONENT_DIR / "www" / "comelit-intercom-card.js").read_text(
         encoding="utf-8"
     )
 
     assert 'customElements.whenDefined("ha-hls-player")' in card
+    assert 'customElements.whenDefined("ha-web-rtc-player")' in card
+    assert 'document.createElement("ha-web-rtc-player")' in card
     assert 'document.createElement("ha-hls-player")' in card
     assert "stream.allowExoPlayer = true" in card
+    assert "this._mountHlsStream" in card
+    assert "}, 8000);" in card
     assert "window.loadCardHelpers" in card
     assert 'type: "camera/webrtc/get_client_config"' in card
     assert "new RTCPeerConnection(clientConfig.configuration)" in card
@@ -289,7 +296,9 @@ async def test_outbound_audio_runs_answer_sequence_before_sender() -> None:
     await session.enable_two_way_audio()
 
     session._run_answer_sequence.assert_awaited_once_with(*session._answer_context)
-    session._rtp_receiver.start_audio_sender.assert_called_once_with(123)
+    session._rtp_receiver.start_audio_sender.assert_called_once_with(
+        123, session._send_audio_packet
+    )
     assert session.audio_answered is True
 
 
@@ -307,7 +316,9 @@ async def test_inbound_audio_does_not_repeat_outbound_answer_sequence() -> None:
     await session.enable_two_way_audio()
 
     session._run_answer_sequence.assert_not_awaited()
-    session._rtp_receiver.start_audio_sender.assert_called_once_with(456)
+    session._rtp_receiver.start_audio_sender.assert_called_once_with(
+        456, session._send_audio_packet
+    )
     assert session.audio_answered is True
 
 
@@ -326,6 +337,30 @@ async def test_enabling_audio_is_idempotent() -> None:
 
     session._run_answer_sequence.assert_not_awaited()
     session._rtp_receiver.start_audio_sender.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_microphone_audio_uses_panel_rtpc_tcp_channel() -> None:
+    """PCMA microphone RTP follows the TCP media transport selected by the panel."""
+    receiver = RtpReceiver("192.0.2.1")
+    receiver._running = True
+    receiver._backchannel_queue = asyncio.Queue()
+    receiver._backchannel_queue.put_nowait(bytes([0xD5]) * 160)
+    sent_packets: list[bytes] = []
+
+    async def send_tcp(packet: bytes) -> None:
+        sent_packets.append(packet)
+        receiver._running = False
+
+    receiver.start_audio_sender(0x1234, send_tcp)
+    assert receiver._audio_sender_task is not None
+    await receiver._audio_sender_task
+
+    assert len(sent_packets) == 1
+    assert len(sent_packets[0]) == 172
+    assert sent_packets[0][0] >> 6 == 2
+    assert sent_packets[0][1] & 0x7F == 8
+    assert sent_packets[0][12:] == bytes([0xD5]) * 160
 
 
 @pytest.mark.asyncio

@@ -104,13 +104,13 @@ door_entities:
   - button.comelit_intercom_gate
 ```
 
-Opening the card starts receive-only video over Home Assistant's HLS player,
-which also works through ordinary HTTPS tunnels and the Companion app. The call
-toggle enables or ends exterior audio and switches to WebRTC. Once enabled, the
-microphone button mutes or unmutes your browser/app microphone independently.
-Microphone access requires Home Assistant to be opened over HTTPS. Two-way audio
-also requires a working WebRTC route to Home Assistant (local access or a TURN
-relay when the HTTPS endpoint is behind an HTTP-only tunnel).
+Opening the card prefers Home Assistant's low-latency WebRTC player and falls
+back automatically to authenticated HLS when the browser or Companion app cannot
+establish a WebRTC media route. The call toggle enables or ends exterior audio.
+Once enabled, the microphone button mutes or unmutes your browser/app microphone
+independently. Microphone access requires Home Assistant to be opened over HTTPS.
+Two-way audio also requires a working WebRTC route to Home Assistant (local
+access or a TURN relay when the HTTPS endpoint is behind an HTTP-only tunnel).
 
 Video lifecycle is automatic: opening the card starts an outbound view, ending
 exterior audio restores a receive-only view, and an incoming ring is handled by
