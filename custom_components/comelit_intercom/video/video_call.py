@@ -20,6 +20,7 @@ from .exceptions import VideoCallError
 from .models import DeviceConfig
 from .protocol import (
     encode_answer_peer,
+    encode_answer_video_reconfig,
     encode_call_accepted,
     encode_call_ack,
     encode_call_init,
@@ -27,6 +28,8 @@ from .protocol import (
     encode_door_open_during_video,
     encode_rtpc2_ready,
     encode_rtpc_link,
+    encode_self_view_audio_config_ack,
+    encode_self_view_audio_peer,
     encode_video_config,
 )
 from .rtp_receiver import RtpReceiver
@@ -76,6 +79,7 @@ class VideoCallSession:
         "RTPC2",
         "RTPC_DEVICE",
         "RTPC_DEVICE_REEST",
+        "RTPC_AUDIO",
     )
 
     def __init__(
@@ -97,6 +101,7 @@ class VideoCallSession:
         self._rtsp_server: LocalRtspServer | None = rtsp_server
         self._timeout_task: asyncio.Task[None] | None = None
         self._tcp_task: asyncio.Task[None] | None = None
+        self._audio_tcp_task: asyncio.Task[None] | None = None
         self._ctpp_task: asyncio.Task[None] | None = None
         self._active = False
         self._inbound = False
@@ -601,8 +606,13 @@ class VideoCallSession:
         """
         self._active = False
 
-        for task_attr in ("_timeout_task", "_tcp_task", "_ctpp_task"):
-            task = getattr(self, task_attr)
+        for task_attr in (
+            "_timeout_task",
+            "_tcp_task",
+            "_audio_tcp_task",
+            "_ctpp_task",
+        ):
+            task = getattr(self, task_attr, None)
             setattr(self, task_attr, None)
             if task and not task.done():
                 task.cancel()
@@ -977,25 +987,64 @@ class VideoCallSession:
         call_counter: int,
         media_req_id: int,
     ) -> None:
-        """Send peer/accept (0x1840/0x0070) to signal "call answered".
+        """Turn a self-view session into a call with the captured audio sequence.
 
-        PCAP-verified: the Android app sends a single 0x1840/0x0070 message after
-        video starts. Tested against real device: the device does NOT send PCMA audio
-        in response to this message on HA-initiated calls — audio only flows during
-        inbound calls triggered by a visitor pressing the doorbell. The RTSP audio
-        plumbing is kept in place for when that flow is added.
-
-        Uses _ctpp_lock and self._call_counter (not the stale call_counter
-        parameter) so the counter is in sync with keepalive ACKs that
-        _ctpp_monitor_loop may have sent during the 6s readiness wait.
+        The panel expects video reconfiguration, an apartment-targeted peer
+        message, and config action 0x000C. It then opens another RTPC channel
+        for call audio. The simpler entrance-targeted peer message is enough
+        for video renewal but does not enable audio on all firmware.
         """
+        audio_rtpc = client.register_placeholder_channel("RTPC_AUDIO")
+        apt_subaddress = f"{apt_addr}{self._config.apt_subaddress}"
+
         async with self._ctpp_lock:
             self._call_counter += _CTR_INCR_BYTE4
             await client.send_binary(
                 ctpp,
-                encode_answer_peer(our_addr, entrance_addr, self._call_counter),
+                encode_answer_video_reconfig(
+                    our_addr, apt_addr, media_req_id, self._call_counter
+                ),
             )
-        _LOGGER.info("Answer peer/accept (0x70) sent")
+            await asyncio.sleep(0.2)
+
+            self._call_counter += _CTR_INCR_BYTE4
+            await client.send_binary(
+                ctpp,
+                encode_self_view_audio_peer(
+                    our_addr, apt_addr, apt_subaddress, self._call_counter
+                ),
+            )
+            await asyncio.sleep(0.2)
+
+            self._call_counter += _CTR_INCR_BYTE4
+            await client.send_binary(
+                ctpp,
+                encode_self_view_audio_config_ack(
+                    our_addr, apt_addr, self._call_counter
+                ),
+            )
+
+        _LOGGER.info("Self-view audio activation sequence sent")
+        try:
+            await asyncio.wait_for(
+                audio_rtpc.open_event.wait(), timeout=VIDEO_RESPONSE_TIMEOUT
+            )
+        except TimeoutError:
+            client.release_placeholder_channel("RTPC_AUDIO")
+            _LOGGER.warning("Panel did not open the dedicated call-audio RTPC channel")
+            return
+
+        self._device_rtpc_req_id = audio_rtpc.server_channel_id
+        self._device_rtpc_channel = audio_rtpc
+        if self._rtp_receiver:
+            self._rtp_receiver.start_audio_sender(audio_rtpc.server_channel_id)
+            self._audio_tcp_task = asyncio.create_task(
+                self._tcp_audio_loop(audio_rtpc, self._rtp_receiver)
+            )
+        _LOGGER.info(
+            "Dedicated call-audio RTPC channel opened: 0x%04X",
+            audio_rtpc.server_channel_id,
+        )
 
     async def start_inbound(
         self, entrance_addr: str, ring_ts: int, renewal_ack_ts: int = 0
@@ -1406,6 +1455,29 @@ class VideoCallSession:
             pass
         except Exception:
             _LOGGER.debug("TCP inbound media router error", exc_info=True)
+
+    @staticmethod
+    async def _tcp_audio_loop(channel: Channel, receiver: RtpReceiver) -> None:
+        """Route media arriving on the dedicated call-audio RTPC channel."""
+        first_packet = True
+        try:
+            while receiver.running:
+                data = await channel.response_queue.get()
+                if len(data) < 12:
+                    continue
+                if first_packet:
+                    first_packet = False
+                    _LOGGER.info(
+                        "Panel RTP received on dedicated call-audio RTPC "
+                        "(PT=%d, %d bytes)",
+                        data[1] & 0x7F,
+                        len(data),
+                    )
+                receiver.receive_tcp_rtp(data)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            _LOGGER.debug("Dedicated TCP audio router error", exc_info=True)
 
     async def async_open_door_on_ctpp(
         self,

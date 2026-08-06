@@ -48,7 +48,7 @@ class _UdpProtocol(asyncio.DatagramProtocol):
         _LOGGER.debug("UDP socket connected: %s", transport.get_extra_info("sockname"))
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        self._receiver._on_udp_packet(data)
+        self._receiver._on_udp_packet(data, addr)
 
     def error_received(self, exc: Exception) -> None:
         _LOGGER.error("UDP error: %s", exc)
@@ -130,6 +130,7 @@ class RtpReceiver:
         self._audio_sender_req_id: int = 0
         self._audio_sent_count: int = 0
         self._microphone_frame_count: int = 0
+        self._udp_control_response_count: int = 0
 
         # Fires as soon as the first video NAL has been queued — callers can
         # await this to know that video is actually flowing before reporting
@@ -350,12 +351,30 @@ class RtpReceiver:
             )
         self._process_rtp(data)
 
-    def _on_udp_packet(self, data: bytes) -> None:
+    def _on_udp_packet(self, data: bytes, addr: tuple[str, int] | None = None) -> None:
         """Process a received UDP packet — extract RTP and queue NAL units."""
-        if len(data) < HEADER_SIZE + 12:
+        if len(data) < HEADER_SIZE:
             return
 
         req_id = struct.unpack_from("<H", data, 4)[0]
+
+        # Comelit mirrors the 14-byte keepalive packet back to the client. It
+        # is shorter than RTP, so handle it before applying the RTP length
+        # check. This proves that routed/VLAN UDP reaches the panel in both
+        # directions instead of silently hiding the acknowledgement.
+        if req_id == self._control_req_id:
+            self._udp_control_response_count += 1
+            if self._udp_control_response_count == 1:
+                source = f" from {addr[0]}:{addr[1]}" if addr else ""
+                _LOGGER.info(
+                    "Panel acknowledged UDP media socket%s (%d bytes)",
+                    source,
+                    len(data),
+                )
+            return
+
+        if len(data) < HEADER_SIZE + 12:
+            return
 
         media_req_ids = {
             self._media_req_id,
@@ -380,9 +399,6 @@ class RtpReceiver:
             # Parse RTP header and extract NAL units
             if len(raw_rtp) >= 13:
                 self._process_rtp(raw_rtp)
-
-        elif req_id == self._control_req_id:
-            _LOGGER.debug("Received UDP control response (%d bytes)", len(data))
 
     def _process_rtp(self, rtp: bytes) -> None:
         """Parse RTP packet — route to audio or H.264 pipeline by payload type."""

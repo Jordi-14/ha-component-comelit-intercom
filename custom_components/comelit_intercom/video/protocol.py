@@ -270,6 +270,7 @@ ACTION_RTPC_LINK = 0x000A
 ACTION_VIDEO_CONFIG = 0x001A
 ACTION_PEER = 0x0070  # "accept call" / peer (answer sequence msg 1)
 ACTION_CONFIG_ACK = 0x000E  # supplemental config ACK (answer sequence msg 2)
+ACTION_SELF_VIEW_AUDIO_CONFIG = 0x000C
 ACTION_HANGUP = 0x002D  # '-' = hangup
 ACTION_DOOR_OPEN = 0x000D  # door open on active video CTPP channel (PCAP-verified)
 ACTION_CALL_ACCEPTED = 0x0002  # device→app on outbound; app→device on inbound answer
@@ -497,6 +498,49 @@ def encode_answer_video_reconfig(
         callee=apt_addr,
         extra=bytes(extra),
     )
+
+
+def encode_self_view_audio_peer(
+    caller: str,
+    apt_addr: str,
+    apt_subaddress: str,
+    timestamp: int,
+) -> bytes:
+    """Encode the peer message used to add audio to a self-view session.
+
+    Unlike the regular outbound peer message, the captured audio activation
+    sequence targets the apartment and carries its full subaddress inside the
+    peer payload.
+    """
+    inner_payload = apt_subaddress.encode("ascii") + b"\x00" + b"\x01\x00\x00\x00"
+    buf = bytearray()
+    buf += struct.pack("<H", 0x1840)
+    buf += struct.pack("<I", timestamp)
+    buf += struct.pack(">H", len(inner_payload))
+    buf += struct.pack(">H", ACTION_PEER)
+    buf += inner_payload
+    buf += b"\xff\xff\xff\xff"
+    buf += _null_terminated(caller)
+    buf += apt_addr.encode("ascii") + b"\x00\x00"
+    return bytes(buf)
+
+
+def encode_self_view_audio_config_ack(
+    caller: str,
+    apt_addr: str,
+    timestamp: int,
+) -> bytes:
+    """Encode the final config message in self-view audio activation."""
+    buf = bytearray()
+    buf += struct.pack("<H", 0x1840)
+    buf += struct.pack("<I", timestamp)
+    buf += struct.pack(">H", 0x0002)
+    buf += struct.pack(">H", ACTION_SELF_VIEW_AUDIO_CONFIG)
+    buf += b"\x00\x00"
+    buf += b"\xff\xff\xff\xff"
+    buf += _null_terminated(caller)
+    buf += apt_addr.encode("ascii") + b"\x00\x00"
+    return bytes(buf)
 
 
 def encode_answer_peer(

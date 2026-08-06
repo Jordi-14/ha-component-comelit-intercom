@@ -66,6 +66,10 @@ from custom_components.comelit_intercom.video.models import (  # noqa: E402
     DeviceConfig,
     Door,
 )
+from custom_components.comelit_intercom.video.protocol import (  # noqa: E402
+    encode_self_view_audio_config_ack,
+    encode_self_view_audio_peer,
+)
 from custom_components.comelit_intercom.video.rtp_receiver import (  # noqa: E402
     RtpReceiver,
 )
@@ -185,6 +189,7 @@ async def test_video_cleanup_closes_remote_media_channels() -> None:
         "RTPC2",
         "RTPC_DEVICE",
         "RTPC_DEVICE_REEST",
+        "RTPC_AUDIO",
     }
     assert session.cleanup_requires_reconnect is True
 
@@ -432,6 +437,69 @@ async def test_outbound_audio_runs_answer_sequence_before_sender() -> None:
     assert session.audio_answered is True
 
 
+def test_self_view_audio_messages_use_apartment_targeting() -> None:
+    """Self-view audio uses the apartment-specific captured wire format."""
+    peer = encode_self_view_audio_peer("SB0000011", "SB000001", "SB0000011", 0x12345678)
+    config = encode_self_view_audio_config_ack("SB0000011", "SB000001", 0x12355678)
+
+    assert struct.unpack_from("<H", peer, 0)[0] == 0x1840
+    assert struct.unpack_from(">H", peer, 8)[0] == 0x0070
+    assert b"SB0000011\0\x01\0\0\0" in peer
+    assert peer.endswith(b"SB000001\0\0")
+    assert struct.unpack_from("<H", config, 0)[0] == 0x1840
+    assert struct.unpack_from(">H", config, 8)[0] == 0x000C
+    assert config.endswith(b"SB000001\0\0")
+
+
+@pytest.mark.asyncio
+async def test_self_view_audio_routes_dedicated_panel_rtpc() -> None:
+    """The call activation sequence consumes the audio RTPC opened by the panel."""
+    session = VideoCallSession.__new__(VideoCallSession)
+    session._config = MagicMock(apt_subaddress=1)
+    session._ctpp_lock = asyncio.Lock()
+    session._call_counter = 0x10000000
+    session._audio_tcp_task = None
+    receiver = MagicMock()
+    receiver.running = False
+    session._rtp_receiver = receiver
+    client = MagicMock()
+    audio_rtpc = Channel(
+        name="RTPC_AUDIO",
+        channel_type=ChannelType.UAUT,
+        request_id=0,
+    )
+    client.register_placeholder_channel.return_value = audio_rtpc
+    sent: list[bytes] = []
+
+    async def send_binary(_channel: Channel, payload: bytes) -> None:
+        sent.append(payload)
+        if len(sent) == 3:
+            audio_rtpc.server_channel_id = 0x3456
+            audio_rtpc.is_open = True
+            audio_rtpc.open_event.set()
+
+    client.send_binary = AsyncMock(side_effect=send_binary)
+
+    await session._send_answer_sequence(
+        client,
+        MagicMock(),
+        "SB0000011",
+        "SB100001",
+        "SB000001",
+        0,
+        0x2002,
+    )
+    if session._audio_tcp_task:
+        await session._audio_tcp_task
+
+    assert struct.unpack_from(">H", sent[0], 6)[0] == 0x001A
+    assert struct.unpack_from(">H", sent[1], 8)[0] == 0x0070
+    assert struct.unpack_from(">H", sent[2], 8)[0] == 0x000C
+    assert session._device_rtpc_req_id == 0x3456
+    receiver.start_audio_sender.assert_called_once_with(0x3456)
+    client.release_placeholder_channel.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_inbound_audio_does_not_repeat_outbound_answer_sequence() -> None:
     """Inbound signaling is already answered before its audio path is enabled."""
@@ -506,6 +574,20 @@ def test_udp_audio_accepts_all_comelit_media_request_ids(request_id: int) -> Non
     receiver._on_udp_packet(packet)
 
     receiver._process_audio_rtp.assert_called_once_with(rtp, 8)
+
+
+def test_short_udp_control_response_is_recorded_before_rtp_validation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The panel's 14-byte keepalive reply must not be discarded as short RTP."""
+    receiver = RtpReceiver("192.0.2.1", control_req_id=0x2000)
+    packet = struct.pack("<BBHH2s6s", 0, 6, 6, 0x2000, b"\0\0", b"\x01\x02\0\0\0\x80")
+
+    with caplog.at_level(logging.INFO):
+        receiver._on_udp_packet(packet, ("192.0.2.1", 64100))
+
+    assert receiver._udp_control_response_count == 1
+    assert "Panel acknowledged UDP media socket" in caplog.text
 
 
 @pytest.mark.asyncio
