@@ -105,6 +105,7 @@ class VideoCallSession:
             tuple[IconaBridgeClient, Channel, str, str, str, int, int] | None
         ) = None
         self._device_rtpc_req_id: int = 0
+        self._cleanup_requires_reconnect: bool = False
         # True when this session opened CTPP itself (notifications OFF).
         # False when reusing the coordinator-opened channel (notifications ON).
         # Determines whether _cleanup removes CTPP/CSPB from the client registry.
@@ -139,6 +140,11 @@ class VideoCallSession:
     def rtsp_server(self) -> LocalRtspServer | None:
         """Return the RTSP server for go2rtc stream_source."""
         return self._rtsp_server
+
+    @property
+    def cleanup_requires_reconnect(self) -> bool:
+        """Return whether channel release needs a TCP reset before reuse."""
+        return self._cleanup_requires_reconnect
 
     def _ts(self) -> int:
         """Return current timestamp for CTPP messages."""
@@ -610,18 +616,28 @@ class VideoCallSession:
                 await self._rtsp_server.stop()
             self._rtsp_server = None
 
-        # Release our channels back to the shared client but do NOT disconnect —
-        # the coordinator owns the TCP connection and other consumers (VIP
-        # listener, door open, PUSH) are still using it.
-        # CTPP and CSPB are only removed when this session opened them itself
-        # (notifications OFF). When the coordinator opened them, they outlive
-        # the video session so the VIP listener can reattach afterwards.
+        # Release every session-owned channel on the device, not only from the
+        # local registry. Otherwise the panel keeps sending RTP on the orphaned
+        # RTPC2 channel and accepts the next call without ever producing media.
+        # Shared CTPP/CSPB channels remain open for the VIP listener. If any END
+        # is not acknowledged, the coordinator resets the TCP connection before
+        # it permits another session to start.
         client = self._client
         if client:
-            for name in self._VIDEO_CHANNEL_NAMES:
-                if name in ("CTPP", "CSPB") and not self._owns_ctpp:
-                    continue
-                client.remove_channel(name)
+            close_names = [
+                name
+                for name in self._VIDEO_CHANNEL_NAMES
+                if name not in ("CTPP", "CSPB") or self._owns_ctpp
+            ]
+            close_results = await asyncio.gather(
+                *(client.close_channel(name) for name in close_names)
+            )
+            self._cleanup_requires_reconnect |= not all(close_results)
+            if self._cleanup_requires_reconnect:
+                _LOGGER.warning(
+                    "One or more video channels did not close cleanly; "
+                    "the connection must be reset before the next call"
+                )
 
     @staticmethod
     async def _tcp_video_loop(

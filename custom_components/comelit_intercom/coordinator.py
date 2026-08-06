@@ -293,7 +293,7 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
     async def async_shutdown(self) -> None:
         """Disconnect from the device."""
         self._cancel_keepalive()
-        await self.async_stop_video()
+        await self.async_stop_video(reason="shutdown")
         if self._vip_listener:
             with contextlib.suppress(Exception):
                 await self._vip_listener.stop()
@@ -530,6 +530,17 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 await self._notify_video_state_change()
                 return session
             except Exception:
+                if session.cleanup_requires_reconnect:
+                    _LOGGER.info(
+                        "Resetting Comelit connection after incomplete video cleanup"
+                    )
+                    try:
+                        await self._reconnect()
+                    except Exception:
+                        _LOGGER.warning(
+                            "Failed to reset connection after video start failure",
+                            exc_info=True,
+                        )
                 await self._ensure_vip_listener()
                 raise
 
@@ -612,6 +623,14 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 )
             except Exception:
                 _LOGGER.warning("Inbound call answer failed", exc_info=True)
+                if session.cleanup_requires_reconnect:
+                    try:
+                        await self._reconnect()
+                    except Exception:
+                        _LOGGER.warning(
+                            "Failed to reset connection after inbound call failure",
+                            exc_info=True,
+                        )
                 self._on_push_event(
                     PushEvent(
                         event_type="missed_call",
@@ -776,6 +795,14 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 _LOGGER.exception("Error in stop-video callback")
 
         await session.stop(reason=reason)
+        if session.cleanup_requires_reconnect and reason not in (
+            "reconnect",
+            "shutdown",
+        ):
+            _LOGGER.info(
+                "Resetting Comelit connection to finish releasing video channels"
+            )
+            await self._reconnect()
         # Block future PLAYs until the next session is ready, and
         # kick any remaining RTSP clients (e.g. go2rtc) so they
         # reconnect fresh against a stream that already has video.

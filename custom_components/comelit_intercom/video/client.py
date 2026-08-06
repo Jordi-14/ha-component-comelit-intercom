@@ -32,6 +32,7 @@ _LOGGER = logging.getLogger(__name__)
 
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT = 30
+CLOSE_TIMEOUT = 1.5
 
 
 class IconaBridgeClient:
@@ -48,6 +49,7 @@ class IconaBridgeClient:
         self._channels: dict[str, Channel] = {}
         self._receive_task: asyncio.Task[None] | None = None
         self._callbacks: dict[int, asyncio.Future[bytes]] = {}
+        self._close_waiters: dict[int, asyncio.Future[None]] = {}
         self._push_callback: Callable[[dict[str, Any]], None] | None = None
         self._connected = False
         self._disconnect_callback: Callable[[], None] | None = None
@@ -114,6 +116,10 @@ class IconaBridgeClient:
             if not future.done():
                 future.cancel()
         self._callbacks.clear()
+        for future in self._close_waiters.values():
+            if not future.done():
+                future.cancel()
+        self._close_waiters.clear()
         _LOGGER.debug("Disconnected from %s:%s", self.host, self.port)
 
     async def _send(self, data: bytes) -> None:
@@ -205,6 +211,13 @@ class IconaBridgeClient:
             self._dispatch_command_response(body)
             return
 
+        # Some firmware acknowledges a locally initiated END on the channel's
+        # request ID instead of request_id=0. Route that control response before
+        # normal channel data so close_channel() can complete its release barrier.
+        if len(body) >= 4 and struct.unpack_from("<H", body, 0)[0] == 0x01EF:
+            self._dispatch_command_response(body, request_id=request_id)
+            return
+
         # Data response — check if there's a waiting future (for send_json)
         if request_id in self._callbacks:
             _LOGGER.debug("Matched callback for request_id=%d", request_id)
@@ -239,10 +252,12 @@ class IconaBridgeClient:
                 "Unsolicited binary on channel %d, %d bytes", request_id, len(body)
             )
 
-    def _dispatch_command_response(self, body: bytes) -> None:
-        """Handle a request_id=0 command/control packet from the device."""
+    def _dispatch_command_response(self, body: bytes, request_id: int = 0) -> None:
+        """Handle a command/control packet from the device."""
         if len(body) >= 4:
             msg_type, seq, server_ch_id = parse_command_response(body)
+            if msg_type == 0x01EF and server_ch_id == 0:
+                server_ch_id = request_id
             _LOGGER.debug(
                 "Command response: type=0x%04X seq=%d ch_id=%d",
                 msg_type,
@@ -311,12 +326,12 @@ class IconaBridgeClient:
                             "Channel %s assigned id=%d", ch.name, server_ch_id
                         )
                         break
-            elif msg_type == 0x01EF and len(body) >= 10:
+            elif msg_type == 0x01EF:
                 # Device-initiated channel close (END type, sub_type=2 in bytes 4-7).
                 # Must ACK with type=4 response so device can re-open the channel.
                 # PCAP-verified: app sends ef01 0400 04000000 [ch_id LE16] 0000.
                 sub_type = struct.unpack_from("<I", body, 4)[0] if len(body) >= 8 else 0
-                if sub_type == 2:
+                if sub_type == 2 and server_ch_id:
                     ack_body = (
                         struct.pack("<HH", 0x01EF, 4)  # END magic + seq=4
                         + struct.pack("<I", 4)  # sub_type=4 (close ACK)
@@ -341,6 +356,8 @@ class IconaBridgeClient:
                         server_ch_id,
                         sub_type,
                     )
+                if server_ch_id:
+                    self._mark_channel_closed(server_ch_id)
             else:
                 _LOGGER.debug(
                     "Non-COMMAND message type=0x%04X (not assigning)", msg_type
@@ -402,19 +419,58 @@ class IconaBridgeClient:
 
         return channel
 
-    async def close_channel(self, name: str) -> None:
+    def _mark_channel_closed(self, server_channel_id: int) -> None:
+        """Resolve a close waiter and forget the matching local channel."""
+        waiter = self._close_waiters.get(server_channel_id)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(None)
+        for name, channel in list(self._channels.items()):
+            if channel.server_channel_id == server_channel_id:
+                channel.is_open = False
+                self._channels.pop(name, None)
+
+    async def close_channel(self, name: str) -> bool:
         """Close a named channel.
 
         Sends an END packet to the device using the channel's server_channel_id
-        as request_id so the device releases its associated session state (e.g.
-        CTPP VIP registration). Removes the channel from the local registry
-        before sending so the channel is always cleaned up even if send fails.
+        as request_id and waits briefly for the matching END response. Returning
+        False tells the coordinator to reset the shared TCP connection before a
+        new call is allowed to start.
         """
         channel = self._channels.pop(name, None)
         if channel is None:
-            return
-        seq = self._next_sequence()
-        await self._send(encode_channel_close(seq, channel.server_channel_id))
+            return True
+        channel.is_open = False
+        server_channel_id = channel.server_channel_id
+        if server_channel_id == 0:
+            return True
+
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future[None] = loop.create_future()
+        self._close_waiters[server_channel_id] = waiter
+        try:
+            # Channel opens use seq=1 and the device replies with seq=2, so the
+            # app's END must use this channel's next sequence (normally 3).
+            await self._send(
+                encode_channel_close(channel.next_sequence(), server_channel_id)
+            )
+            try:
+                async with asyncio.timeout(CLOSE_TIMEOUT):
+                    await waiter
+            except TimeoutError:
+                _LOGGER.warning(
+                    "Timed out waiting for %s channel close ACK (ch=0x%04X)",
+                    name,
+                    server_channel_id,
+                )
+                return False
+            _LOGGER.debug("Closed channel %s (ch=0x%04X)", name, server_channel_id)
+            return True
+        except Exception:
+            _LOGGER.debug("Failed to close channel %s", name, exc_info=True)
+            return False
+        finally:
+            self._close_waiters.pop(server_channel_id, None)
 
     async def send_json(self, channel: Channel, msg: dict[str, Any]) -> dict[str, Any]:
         """Send a JSON message on a channel and wait for JSON response.

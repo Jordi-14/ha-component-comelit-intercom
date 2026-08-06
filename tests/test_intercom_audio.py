@@ -47,6 +47,13 @@ _package("custom_components", COMPONENT_DIR.parent)
 _package("custom_components.comelit_intercom", COMPONENT_DIR)
 _package("custom_components.comelit_intercom.video", COMPONENT_DIR / "video")
 
+from custom_components.comelit_intercom.video.channels import (  # noqa: E402
+    Channel,
+    ChannelType,
+)
+from custom_components.comelit_intercom.video.client import (  # noqa: E402
+    IconaBridgeClient,
+)
 from custom_components.comelit_intercom.video.exceptions import (  # noqa: E402
     VideoCallError,
 )
@@ -57,6 +64,72 @@ from custom_components.comelit_intercom.video.rtsp_server import (  # noqa: E402
 from custom_components.comelit_intercom.video.video_call import (  # noqa: E402
     VideoCallSession,
 )
+
+
+@pytest.mark.asyncio
+async def test_channel_close_waits_for_device_release() -> None:
+    """A video channel is not reusable until the panel completes its END flow."""
+    client = IconaBridgeClient("192.0.2.1")
+    writer = MagicMock()
+    writer.drain = AsyncMock()
+    client._writer = writer
+    channel = Channel(
+        name="RTPC2",
+        channel_type=ChannelType.UAUT,
+        request_id=123,
+        server_channel_id=0x2103,
+        sequence=3,
+        is_open=True,
+    )
+    client._channels[channel.name] = channel
+
+    close_task = asyncio.create_task(client.close_channel(channel.name))
+    await asyncio.sleep(0)
+
+    assert close_task.done() is False
+    close_packet = writer.write.call_args_list[0].args[0]
+    assert close_packet[4:6] == struct.pack("<H", channel.server_channel_id)
+    assert close_packet[8:12] == struct.pack("<HH", 0x01EF, 3)
+
+    device_end = struct.pack("<HHIH", 0x01EF, 3, 2, channel.server_channel_id)
+    client._dispatch(0, device_end)
+
+    assert await close_task is True
+    assert channel.name not in client._channels
+    close_ack = writer.write.call_args_list[1].args[0]
+    assert close_ack[8:18] == struct.pack(
+        "<HHIH", 0x01EF, 4, 4, channel.server_channel_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_video_cleanup_closes_remote_media_channels() -> None:
+    """Cleanup sends ENDs and requests a reset when one is not acknowledged."""
+    session = VideoCallSession.__new__(VideoCallSession)
+    session._active = True
+    session._timeout_task = None
+    session._tcp_task = None
+    session._ctpp_task = None
+    session._rtp_receiver = None
+    session._rtsp_server = None
+    session._external_rtsp = True
+    session._owns_ctpp = False
+    session._cleanup_requires_reconnect = False
+    client = MagicMock()
+    client.close_channel = AsyncMock(side_effect=lambda name: name != "RTPC2")
+    session._client = client
+
+    await session._cleanup()
+
+    closed_names = {call.args[0] for call in client.close_channel.await_args_list}
+    assert closed_names == {
+        "UDPM",
+        "RTPC",
+        "RTPC2",
+        "RTPC_DEVICE",
+        "RTPC_DEVICE_REEST",
+    }
+    assert session.cleanup_requires_reconnect is True
 
 
 @pytest.mark.asyncio
