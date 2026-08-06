@@ -9,7 +9,6 @@ import logging
 import secrets
 import struct
 import time
-from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .const import is_verbose_logging
@@ -82,6 +81,7 @@ class RtpReceiver:
         self._port = port
         self._control_req_id = control_req_id
         self._media_req_id = media_req_id
+        self._audio_req_id = 0
         self._udpm_token = udpm_token
 
         # UDP transport to device
@@ -128,7 +128,6 @@ class RtpReceiver:
         self._keepalive_task: asyncio.Task[None] | None = None
         self._audio_sender_task: asyncio.Task[None] | None = None
         self._audio_sender_req_id: int = 0
-        self._audio_tcp_sender: Callable[[bytes], Awaitable[None]] | None = None
         self._audio_sent_count: int = 0
         self._microphone_frame_count: int = 0
 
@@ -215,32 +214,24 @@ class RtpReceiver:
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
         _LOGGER.debug("UDP keepalive loop started")
 
-    def start_audio_sender(
-        self,
-        device_rtpc_req_id: int,
-        tcp_sender: Callable[[bytes], Awaitable[None]] | None = None,
-    ) -> None:
+    def start_audio_sender(self, device_rtpc_req_id: int) -> None:
         """Start sending PCMA audio frames to the device.
 
-        The panel opens an RTPC channel for app-to-panel audio.  When media is
-        negotiated over TCP, ``tcp_sender`` writes RTP on that channel.  The
-        UDP fallback is retained for firmware which actually chooses UDP.
+        The captured Comelit app protocol sends ICONA-wrapped RTP over the
+        existing UDP media socket, addressed to the panel-opened RTPC ID.
         """
         if self._audio_sender_task and not self._audio_sender_task.done():
             if self._audio_sender_req_id == device_rtpc_req_id:
-                self._audio_tcp_sender = tcp_sender
                 _LOGGER.debug("Audio sender already running — skipping duplicate start")
                 return
             self._audio_sender_task.cancel()
         self._audio_sender_req_id = device_rtpc_req_id
-        self._audio_tcp_sender = tcp_sender
         self._audio_sender_task = asyncio.create_task(
             self._audio_send_loop(device_rtpc_req_id)
         )
         _LOGGER.debug(
-            "Audio sender started (device_rtpc_req_id=0x%04X, transport=%s)",
+            "Audio sender started (device_rtpc_req_id=0x%04X, transport=UDP)",
             device_rtpc_req_id,
-            "TCP" if tcp_sender else "UDP",
         )
 
     async def _audio_send_loop(self, device_rtpc_req_id: int) -> None:
@@ -265,10 +256,7 @@ class RtpReceiver:
                         payload = self._backchannel_queue.get_nowait()
                         self._microphone_frame_count += 1
                         if self._microphone_frame_count == 1:
-                            _LOGGER.info(
-                                "Microphone audio flowing to panel over %s",
-                                "TCP" if self._audio_tcp_sender else "UDP",
-                            )
+                            _LOGGER.info("Microphone audio flowing to panel over UDP")
                 rtp_header = struct.pack(
                     ">BBHII",
                     0x80,  # V=2, P=0, X=0, CC=0
@@ -278,10 +266,7 @@ class RtpReceiver:
                     ssrc,
                 )
                 rtp_packet = rtp_header + payload[:160]
-                if self._audio_tcp_sender is not None:
-                    await self._audio_tcp_sender(rtp_packet)
-                    self._audio_sent_count += 1
-                elif self._transport:
+                if self._transport:
                     self._transport.sendto(icona_prefix + rtp_packet)
                     self._audio_sent_count += 1
                 seq += 1
@@ -304,6 +289,11 @@ class RtpReceiver:
         """Set the media request ID once RTPC2 is opened."""
         self._media_req_id = media_req_id
         _LOGGER.debug("Media req_id set to 0x%04X", media_req_id)
+
+    def set_audio_req_id(self, audio_req_id: int) -> None:
+        """Set the app-opened RTPC1 request ID used by some audio streams."""
+        self._audio_req_id = audio_req_id
+        _LOGGER.debug("Audio req_id set to 0x%04X", audio_req_id)
 
     async def start_media(self) -> None:
         """Start the decode task for processing H.264 NAL units.
@@ -367,7 +357,14 @@ class RtpReceiver:
 
         req_id = struct.unpack_from("<H", data, 4)[0]
 
-        if req_id == self._media_req_id:
+        media_req_ids = {
+            self._media_req_id,
+            self._audio_req_id,
+            self._audio_sender_req_id,
+        }
+        media_req_ids.discard(0)
+
+        if req_id in media_req_ids:
             # Strip 8-byte ICONA header AND Comelit trailer using body_len
             body_len = struct.unpack_from("<H", data, 2)[0]
             raw_rtp = data[HEADER_SIZE : HEADER_SIZE + body_len]

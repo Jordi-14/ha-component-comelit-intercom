@@ -428,9 +428,7 @@ async def test_outbound_audio_runs_answer_sequence_before_sender() -> None:
     await session.enable_two_way_audio()
 
     session._run_answer_sequence.assert_awaited_once_with(*session._answer_context)
-    session._rtp_receiver.start_audio_sender.assert_called_once_with(
-        123, session._send_audio_packet
-    )
+    session._rtp_receiver.start_audio_sender.assert_called_once_with(123)
     assert session.audio_answered is True
 
 
@@ -448,9 +446,7 @@ async def test_inbound_audio_does_not_repeat_outbound_answer_sequence() -> None:
     await session.enable_two_way_audio()
 
     session._run_answer_sequence.assert_not_awaited()
-    session._rtp_receiver.start_audio_sender.assert_called_once_with(
-        456, session._send_audio_packet
-    )
+    session._rtp_receiver.start_audio_sender.assert_called_once_with(456)
     assert session.audio_answered is True
 
 
@@ -472,27 +468,44 @@ async def test_enabling_audio_is_idempotent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_microphone_audio_uses_panel_rtpc_tcp_channel() -> None:
-    """PCMA microphone RTP follows the TCP media transport selected by the panel."""
+async def test_microphone_audio_uses_captured_udp_rtpc_transport() -> None:
+    """PCMA microphone RTP uses ICONA-wrapped UDP with the panel RTPC ID."""
     receiver = RtpReceiver("192.0.2.1")
     receiver._running = True
     receiver._backchannel_queue = asyncio.Queue()
     receiver._backchannel_queue.put_nowait(bytes([0xD5]) * 160)
-    sent_packets: list[bytes] = []
+    transport = MagicMock()
+    receiver._transport = transport
 
-    async def send_tcp(packet: bytes) -> None:
-        sent_packets.append(packet)
+    def stop_after_send(_packet: bytes) -> None:
         receiver._running = False
 
-    receiver.start_audio_sender(0x1234, send_tcp)
+    transport.sendto.side_effect = stop_after_send
+    receiver.start_audio_sender(0x1234)
     assert receiver._audio_sender_task is not None
     await receiver._audio_sender_task
 
-    assert len(sent_packets) == 1
-    assert len(sent_packets[0]) == 172
-    assert sent_packets[0][0] >> 6 == 2
-    assert sent_packets[0][1] & 0x7F == 8
-    assert sent_packets[0][12:] == bytes([0xD5]) * 160
+    packet = transport.sendto.call_args.args[0]
+    assert len(packet) == 180
+    assert packet[:8] == struct.pack("<BBHH2s", 0, 6, 172, 0x1234, b"\0\0")
+    assert packet[8] >> 6 == 2
+    assert packet[9] & 0x7F == 8
+    assert packet[20:] == bytes([0xD5]) * 160
+
+
+@pytest.mark.parametrize("request_id", [0x2001, 0x2002, 0x2003])
+def test_udp_audio_accepts_all_comelit_media_request_ids(request_id: int) -> None:
+    """Exterior audio may be tagged as RTPC1, RTPC2, or panel-opened RTPC."""
+    receiver = RtpReceiver("192.0.2.1", media_req_id=0x2002)
+    receiver.set_audio_req_id(0x2001)
+    receiver._audio_sender_req_id = 0x2003
+    receiver._process_audio_rtp = MagicMock()
+    rtp = struct.pack("!BBHII", 0x80, 8, 1, 160, 1234) + b"\xd5" * 160
+    packet = struct.pack("<BBHH2s", 0, 6, len(rtp), request_id, b"\0\0") + rtp
+
+    receiver._on_udp_packet(packet)
+
+    receiver._process_audio_rtp.assert_called_once_with(rtp, 8)
 
 
 @pytest.mark.asyncio

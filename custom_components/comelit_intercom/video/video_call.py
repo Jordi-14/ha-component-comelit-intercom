@@ -514,6 +514,7 @@ class VideoCallSession:
 
             # Step 10: Set media req_id and start decoder immediately.
             receiver.set_media_req_id(media_req_id)
+            receiver.set_audio_req_id(rtpc1.server_channel_id)
             await receiver.start_media()
 
             # Step 10b: Start TCP video reader for RTPC2 BEFORE the CTPP
@@ -896,9 +897,7 @@ class VideoCallSession:
         self._device_rtpc_req_id = device_rtpc.server_channel_id
         self._device_rtpc_channel = device_rtpc
         if getattr(self, "_audio_answered", False) and self._rtp_receiver:
-            self._rtp_receiver.start_audio_sender(
-                self._device_rtpc_req_id, self._send_audio_packet
-            )
+            self._rtp_receiver.start_audio_sender(self._device_rtpc_req_id)
         if self._tcp_task and not self._tcp_task.done():
             self._tcp_task.cancel()
         if self._rtp_receiver:
@@ -1176,6 +1175,7 @@ class VideoCallSession:
             rtpc2 = await rtpc2_task
             media_req_id = rtpc2.server_channel_id
             receiver.set_media_req_id(media_req_id)
+            receiver.set_audio_req_id(rtpc1.server_channel_id)
             await receiver.start_media()
 
             # Step 9: RTPC2-ready (+B4) — purpose unknown; required by device (PCAP2)
@@ -1347,9 +1347,7 @@ class VideoCallSession:
                 "answer_inbound: no receiver or device RTPC req_id — cannot start audio"
             )
             return
-        self._rtp_receiver.start_audio_sender(
-            self._device_rtpc_req_id, self._send_audio_packet
-        )
+        self._rtp_receiver.start_audio_sender(self._device_rtpc_req_id)
         self._audio_answered = True
         _LOGGER.info(
             "Inbound call answered — audio sender started (req_id=0x%04X)",
@@ -1365,18 +1363,9 @@ class VideoCallSession:
         if not self._rtp_receiver or self._device_rtpc_req_id == 0:
             _LOGGER.warning("No device audio channel is available")
             return
-        self._rtp_receiver.start_audio_sender(
-            self._device_rtpc_req_id, self._send_audio_packet
-        )
+        self._rtp_receiver.start_audio_sender(self._device_rtpc_req_id)
         self._audio_answered = True
         _LOGGER.info("Two-way audio enabled (req_id=0x%04X)", self._device_rtpc_req_id)
-
-    async def _send_audio_packet(self, rtp_packet: bytes) -> None:
-        """Send microphone RTP on the RTPC transport opened by the panel."""
-        channel = self._device_rtpc_channel
-        if channel is None or not channel.is_open:
-            raise RuntimeError("The panel audio channel is not open")
-        await self._client.send_binary(channel, rtp_packet)
 
     @staticmethod
     async def _tcp_media_router(

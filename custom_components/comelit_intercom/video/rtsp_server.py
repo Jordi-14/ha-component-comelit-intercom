@@ -310,6 +310,9 @@ class LocalRtspServer:
             with contextlib.suppress(asyncio.QueueEmpty):
                 self.audio_queue.get_nowait()
                 drained_audio += 1
+        while not self.backchannel_queue.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self.backchannel_queue.get_nowait()
         # Audio-video sync bootstrap: the audio feed loop has been advancing
         # `_audio_ts` by 160 per 20 ms of silence since server start, so by
         # the time the first video frame of a new call arrives, audio is N
