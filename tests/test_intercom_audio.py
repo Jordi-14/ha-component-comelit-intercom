@@ -50,6 +50,10 @@ _package("custom_components.comelit_intercom.video", COMPONENT_DIR / "video")
 from custom_components.comelit_intercom.video.exceptions import (  # noqa: E402
     VideoCallError,
 )
+from custom_components.comelit_intercom.video.rtsp_server import (  # noqa: E402
+    LocalRtspServer,
+    _TcpClient,
+)
 from custom_components.comelit_intercom.video.video_call import (  # noqa: E402
     VideoCallSession,
 )
@@ -172,3 +176,30 @@ async def test_missing_media_is_a_start_failure() -> None:
 
     with pytest.raises(VideoCallError):
         await VideoCallSession._require_first_video(receiver)
+
+
+@pytest.mark.asyncio
+async def test_play_session_routes_interleaved_microphone_audio() -> None:
+    """go2rtc's third SETUP track must feed the Comelit backchannel queue."""
+    server = LocalRtspServer()
+    writer = MagicMock()
+    client = _TcpClient(writer=writer)
+    transport = "RTP/AVP/TCP;unicast;interleaved=4-5"
+
+    response = server._parse_setup(transport, "backchannel", client, "127.0.0.1")
+
+    assert client.backchannel_ch == 4
+    assert "interleaved=4-5" in response
+
+    payload = b"\xd5" * 160
+    rtp = struct.pack("!BBHII", 0x80, 8, 1, 160, 1234) + payload
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"\x24\x04" + struct.pack("!H", len(rtp)) + rtp)
+    reader.feed_data(b"TEARDOWN rtsp://127.0.0.1/intercom RTSP/1.0\r\nCSeq: 4\r\n\r\n")
+    reader.feed_eof()
+    server._running = True
+
+    await server._wait_for_teardown(reader, client, "127.0.0.1")
+
+    assert server.backchannel_queue.get_nowait() == payload
+    assert client.backchannel_started is True

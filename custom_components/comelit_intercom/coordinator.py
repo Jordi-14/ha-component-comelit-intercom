@@ -512,8 +512,12 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
                         self._rtsp_server.backchannel_queue
                     )
                 self._video_session = session
-                self._last_video_end_reason = None
-                self._last_video_end_at = None
+                # Preserve an unexpected end reason across an automatic
+                # recovery so the card can explain why the previous stream
+                # stopped. A deliberate new view starts with a clean status.
+                if by_user:
+                    self._last_video_end_reason = None
+                    self._last_video_end_at = None
                 self._video_ready_event.set()
                 # Unblock PLAY handlers that have been waiting inside the RTSP
                 # server for video to actually flow.  Any stream_worker that
@@ -657,8 +661,10 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
             return
         self.request_video_stop()
         await self.async_stop_video(reason="call audio disabled")
+        # The card reopens a receive-only WebRTC view after the intercom has
+        # had time to release the answered call. Starting here as well raced
+        # the device's RTPC close and produced a signaled session with no RTP.
         self._video_stopped_by_user = False
-        await self.async_start_video(by_user=True)
 
     @property
     def video_stopped_by_user(self) -> bool:

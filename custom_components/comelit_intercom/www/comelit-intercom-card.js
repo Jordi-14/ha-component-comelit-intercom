@@ -134,6 +134,10 @@ class ComelitIntercomCard extends HTMLElement {
     if (wasAudioCall) {
       this._status("Ending exterior audio…");
       await this._setCall(false);
+      // The panel closes its old media channel asynchronously. Reopening
+      // immediately can be accepted at the signaling layer while yielding
+      // no RTP at all, so let that device-side close complete first.
+      await new Promise((resolve) => setTimeout(resolve, 1000));
       await this._connect(false);
     } else {
       await this._connect(true);
@@ -186,7 +190,9 @@ class ComelitIntercomCard extends HTMLElement {
           mic.disabled = !this._mic;
           mic.title = this._mic ? "Mute or unmute your microphone" : "Enable exterior audio first";
         } else if (["failed", "closed"].includes(this._pc.connectionState)) {
-          await this._fail("Video connection failed. Check the Home Assistant log for details.");
+          await this._fail(
+            "The intercom ended this Home Assistant call. Another client, such as the Comelit app, may have taken control.",
+          );
         }
       };
       this._pc.onicecandidate = async (event) => {
