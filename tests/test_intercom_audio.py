@@ -243,6 +243,26 @@ async def test_rtsp_play_waits_for_real_video() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rtsp_parser_preserves_pipelined_requests() -> None:
+    """A PLAY received in the same TCP read as SETUP must not be discarded."""
+    server = LocalRtspServer()
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b"SETUP rtsp://127.0.0.1/intercom/video RTSP/1.0\r\nCSeq: 1\r\n\r\n"
+        b"PLAY rtsp://127.0.0.1/intercom RTSP/1.0\r\nCSeq: 2\r\n\r\n"
+    )
+    buffer = bytearray()
+
+    first = await server._read_rtsp_request(reader, buffer)
+    second = await server._read_rtsp_request(reader, buffer)
+
+    assert first is not None and first[0] == "SETUP"
+    assert second is not None and second[0] == "PLAY"
+    assert second[3] == "2"
+    assert buffer == bytearray()
+
+
+@pytest.mark.asyncio
 async def test_outbound_audio_runs_answer_sequence_before_sender() -> None:
     """An outbound view becomes a call only after audio is explicitly enabled."""
     session = VideoCallSession.__new__(VideoCallSession)

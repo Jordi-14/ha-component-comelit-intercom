@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 from .channels import Channel, ChannelType
+from .const import is_verbose_logging
 from .exceptions import ConnectionComelitError, ProtocolError
 from .protocol import (
     HEADER_SIZE,
@@ -145,7 +146,10 @@ class IconaBridgeClient:
         """Send raw bytes to the device."""
         if not self._writer:
             raise ConnectionComelitError("Not connected")
-        _LOGGER.debug("Writing %d bytes: %s", len(data), _format_packet_for_log(data))
+        if is_verbose_logging():
+            _LOGGER.debug(
+                "Writing %d bytes: %s", len(data), _format_packet_for_log(data)
+            )
         self._writer.write(data)
         try:
             await self._writer.drain()
@@ -158,23 +162,25 @@ class IconaBridgeClient:
             raise ConnectionComelitError("Not connected")
         header = await self._reader.readexactly(HEADER_SIZE)
         body_length, request_id = decode_header(header)
-        _LOGGER.debug(
-            "Read header: %s (body_length=%d, request_id=%d)",
-            header.hex(" "),
-            body_length,
-            request_id,
-        )
+        if is_verbose_logging():
+            _LOGGER.debug(
+                "Read header: %s (body_length=%d, request_id=%d)",
+                header.hex(" "),
+                body_length,
+                request_id,
+            )
         body = await self._reader.readexactly(body_length) if body_length > 0 else b""
-        if is_json_body(body):
-            _LOGGER.debug(
-                "Read JSON body (%d bytes): %s",
-                len(body),
-                body.decode("utf-8", errors="replace")[:500],
-            )
-        else:
-            _LOGGER.debug(
-                "Read binary body (%d bytes): %s", len(body), body.hex(" ")[:200]
-            )
+        if is_verbose_logging():
+            if is_json_body(body):
+                _LOGGER.debug(
+                    "Read JSON body (%d bytes): %s",
+                    len(body),
+                    body.decode("utf-8", errors="replace")[:500],
+                )
+            else:
+                _LOGGER.debug(
+                    "Read binary body (%d bytes): %s", len(body), body.hex(" ")[:200]
+                )
         return request_id, body
 
     def set_disconnect_callback(self, callback: Callable[[], None]) -> None:
@@ -197,7 +203,8 @@ class IconaBridgeClient:
         unexpected = False
         try:
             while self._connected:
-                _LOGGER.debug("Waiting for next packet...")
+                if is_verbose_logging():
+                    _LOGGER.debug("Waiting for next packet...")
                 try:
                     request_id, body = await asyncio.wait_for(
                         self._read_packet(), timeout=120.0
@@ -251,7 +258,7 @@ class IconaBridgeClient:
                 ch.response_queue.put_nowait(body)
                 if is_json_body(body):
                     _LOGGER.debug("Queued JSON on %s (%d bytes)", ch.name, len(body))
-                else:
+                elif is_verbose_logging():
                     _LOGGER.debug("Queued binary on %s (%d bytes)", ch.name, len(body))
                 return
 

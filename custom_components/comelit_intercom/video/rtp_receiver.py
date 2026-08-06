@@ -11,6 +11,7 @@ import struct
 import time
 from typing import Any
 
+from .const import is_verbose_logging
 from .protocol import HEADER_SIZE, ICONA_BRIDGE_PORT
 
 _LOGGER = logging.getLogger(__name__)
@@ -564,7 +565,10 @@ class RtpReceiver:
         frame_count = 0
         consecutive_errors = 0
 
-        verbose = _LOGGER.isEnabledFor(logging.DEBUG)
+        # Per-frame timing and JPEG logs are intentionally separate from HA's
+        # debug logger. At 16 fps they can saturate the event loop and delay
+        # the RTSP handshake that carries the actual live stream.
+        verbose = is_verbose_logging()
 
         try:
             while self._running:

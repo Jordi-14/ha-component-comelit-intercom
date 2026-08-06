@@ -379,10 +379,11 @@ class LocalRtspServer:
         # Per-client state — independent of every other connection
         client = _TcpClient(writer=writer)
         registered = False
+        request_buffer = bytearray()
 
         try:
             while self._running:
-                parsed = await self._read_rtsp_request(reader)
+                parsed = await self._read_rtsp_request(reader, request_buffer)
                 if parsed is None:
                     break
                 method, url, headers, cseq = parsed
@@ -396,6 +397,7 @@ class LocalRtspServer:
                             "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, ANNOUNCE, RECORD\r\n"
                         ),
                     )
+                    await writer.drain()
 
                 elif method == "DESCRIBE":
                     sdp = self._build_sdp().encode()
@@ -425,6 +427,7 @@ class LocalRtspServer:
                         cseq,
                         extra=(f"Session: {self._session_id}\r\n{transport_resp}\r\n"),
                     )
+                    await writer.drain()
 
                 elif method == "PLAY":
                     # Do not let go2rtc bind a producer to an idle relay. The
@@ -450,6 +453,7 @@ class LocalRtspServer:
                         cseq,
                         extra=(f"Session: {self._session_id}\r\nRange: npt=0.000-\r\n"),
                     )
+                    await writer.drain()
                     self._active_clients.append(client)
                     registered = True
                     _LOGGER.info(
@@ -466,11 +470,14 @@ class LocalRtspServer:
                     # enough — recent libavformat only reliably sets pix_fmt
                     # from in-band NAL units seen in the actual RTP stream.
                     self._prime_client_with_parameter_sets(client)
-                    await self._wait_for_teardown(reader, client, client_host)
+                    await self._wait_for_teardown(
+                        reader, client, client_host, request_buffer
+                    )
                     break
 
                 elif method == "TEARDOWN":
                     self._send(writer, cseq, extra=f"Session: {self._session_id}\r\n")
+                    await writer.drain()
                     break
 
                 elif method == "ANNOUNCE":
@@ -478,11 +485,15 @@ class LocalRtspServer:
                     content_len = int(headers.get("content-length", 0))
                     if content_len > 0:
                         with contextlib.suppress(asyncio.IncompleteReadError):
-                            await reader.readexactly(content_len)
+                            await self._readexactly_buffered(
+                                reader, request_buffer, content_len
+                            )
                     self._send(writer, cseq)
                     await writer.drain()
                     _LOGGER.debug("Backchannel ANNOUNCE from %s", client_host)
-                    await self._handle_backchannel(reader, writer, client_host)
+                    await self._handle_backchannel(
+                        reader, writer, client_host, request_buffer
+                    )
                     break
 
                 else:
@@ -508,15 +519,20 @@ class LocalRtspServer:
                 writer.close()
 
     async def _read_rtsp_request(
-        self, reader: asyncio.StreamReader
+        self, reader: asyncio.StreamReader, buffer: bytearray | None = None
     ) -> tuple[str, str, dict[str, str], str] | None:
         """Read one complete RTSP request. Returns (method, url, headers, cseq) or None on close."""
-        raw = b""
-        while b"\r\n\r\n" not in raw:
+        if buffer is None:
+            buffer = bytearray()
+        delimiter = b"\r\n\r\n"
+        while delimiter not in buffer:
             chunk = await asyncio.wait_for(reader.read(4096), timeout=30.0)
             if not chunk:
                 return None
-            raw += chunk
+            buffer.extend(chunk)
+        end = buffer.index(delimiter) + len(delimiter)
+        raw = bytes(buffer[:end])
+        del buffer[:end]
         request = raw.decode("utf-8", errors="replace")
         lines = [ln for ln in request.split("\r\n") if ln]
         if not lines:
@@ -532,6 +548,20 @@ class LocalRtspServer:
                 headers[k.strip().lower()] = v.strip()
         cseq = headers.get("cseq", "1")
         return method, url, headers, cseq
+
+    @staticmethod
+    async def _readexactly_buffered(
+        reader: asyncio.StreamReader, buffer: bytearray, length: int
+    ) -> bytes:
+        """Read exact bytes without losing data already received with RTSP headers."""
+        while len(buffer) < length:
+            chunk = await reader.read(length - len(buffer))
+            if not chunk:
+                raise asyncio.IncompleteReadError(bytes(buffer), length)
+            buffer.extend(chunk)
+        data = bytes(buffer[:length])
+        del buffer[:length]
+        return data
 
     def _parse_setup(
         self,
@@ -620,6 +650,7 @@ class LocalRtspServer:
         reader: asyncio.StreamReader,
         client: _TcpClient,
         client_host: str,
+        request_buffer: bytearray | None = None,
     ) -> None:
         """Receive PLAY-session backchannel RTP until TEARDOWN or disconnect.
 
@@ -627,14 +658,20 @@ class LocalRtspServer:
         RTSP connection used for PLAY. It then sends interleaved RTP on that
         track instead of opening a separate ANNOUNCE/RECORD connection.
         """
+        if request_buffer is None:
+            request_buffer = bytearray()
         while self._running:
             try:
-                first = await asyncio.wait_for(reader.readexactly(1), timeout=10.0)
+                first = await asyncio.wait_for(
+                    self._readexactly_buffered(reader, request_buffer, 1), timeout=10.0
+                )
                 if first == b"\x24":
-                    header = await reader.readexactly(3)
+                    header = await self._readexactly_buffered(reader, request_buffer, 3)
                     channel = header[0]
                     length = struct.unpack("!H", header[1:3])[0]
-                    rtp = await reader.readexactly(length)
+                    rtp = await self._readexactly_buffered(
+                        reader, request_buffer, length
+                    )
                     if (
                         channel == client.backchannel_ch
                         and self._queue_backchannel_rtp(rtp)
@@ -649,7 +686,11 @@ class LocalRtspServer:
 
                 request = first
                 while b"\r\n\r\n" not in request:
-                    chunk = await reader.read(256)
+                    if request_buffer:
+                        chunk = bytes(request_buffer)
+                        request_buffer.clear()
+                    else:
+                        chunk = await reader.read(256)
                     if not chunk:
                         return
                     request += chunk
@@ -665,12 +706,15 @@ class LocalRtspServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         client_host: str,
+        request_buffer: bytearray | None = None,
     ) -> None:
         """Handle SETUP + RECORD for a backchannel connection (after ANNOUNCE accepted)."""
+        if request_buffer is None:
+            request_buffer = bytearray()
         backchannel_ch = 0
         try:
             while self._running:
-                parsed = await self._read_rtsp_request(reader)
+                parsed = await self._read_rtsp_request(reader, request_buffer)
                 if parsed is None:
                     break
                 method, _url, hdrs, cseq = parsed
@@ -694,7 +738,7 @@ class LocalRtspServer:
                     _LOGGER.info(
                         "Backchannel RECORD from %s — mic audio flowing", client_host
                     )
-                    await self._receive_backchannel_rtp(reader)
+                    await self._receive_backchannel_rtp(reader, request_buffer)
                     break
 
                 elif method == "TEARDOWN":
@@ -713,11 +757,17 @@ class LocalRtspServer:
             _LOGGER.debug("Backchannel error", exc_info=True)
         _LOGGER.debug("Backchannel connection from %s closed", client_host)
 
-    async def _receive_backchannel_rtp(self, reader: asyncio.StreamReader) -> None:
+    async def _receive_backchannel_rtp(
+        self, reader: asyncio.StreamReader, request_buffer: bytearray | None = None
+    ) -> None:
         """Read interleaved RTP from backchannel connection and queue audio payloads."""
+        if request_buffer is None:
+            request_buffer = bytearray()
         while self._running:
             try:
-                header = await asyncio.wait_for(reader.readexactly(4), timeout=30.0)
+                header = await asyncio.wait_for(
+                    self._readexactly_buffered(reader, request_buffer, 4), timeout=30.0
+                )
             except asyncio.IncompleteReadError:
                 break
             except ConnectionError:
@@ -738,7 +788,10 @@ class LocalRtspServer:
 
             length = struct.unpack("!H", header[2:4])[0]
             try:
-                rtp = await asyncio.wait_for(reader.readexactly(length), timeout=5.0)
+                rtp = await asyncio.wait_for(
+                    self._readexactly_buffered(reader, request_buffer, length),
+                    timeout=5.0,
+                )
             except (asyncio.IncompleteReadError, TimeoutError):
                 break
 
