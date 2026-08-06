@@ -104,10 +104,13 @@ door_entities:
   - button.comelit_intercom_gate
 ```
 
-Opening the card starts video without requesting microphone access. The call
-toggle enables or ends exterior audio. Once enabled, the microphone button mutes
-or unmutes your browser/app microphone independently. Microphone access requires
-Home Assistant to be opened over HTTPS, including in the Companion app.
+Opening the card starts receive-only video over Home Assistant's HLS player,
+which also works through ordinary HTTPS tunnels and the Companion app. The call
+toggle enables or ends exterior audio and switches to WebRTC. Once enabled, the
+microphone button mutes or unmutes your browser/app microphone independently.
+Microphone access requires Home Assistant to be opened over HTTPS. Two-way audio
+also requires a working WebRTC route to Home Assistant (local access or a TURN
+relay when the HTTPS endpoint is behind an HTTP-only tunnel).
 
 Video lifecycle is automatic: opening the card starts an outbound view, ending
 exterior audio restores a receive-only view, and an incoming ring is handled by
@@ -251,6 +254,8 @@ This integration was made possible thanks to:
 - Only one app can own the Comelit call at a time
 - Two-way-audio behavior may vary between ICONA Bridge models and firmware versions
 - Browser microphone access requires HTTPS
+- Two-way audio requires direct WebRTC reachability or a configured TURN relay;
+  receive-only HLS video continues to work through HTTP-only remote tunnels
 
 ## Developer Information
 

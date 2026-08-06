@@ -185,19 +185,21 @@ def test_card_uses_separate_autoplay_safe_media_elements() -> None:
     assert "video.play().catch" in card
 
 
-def test_card_uses_native_ha_player_and_webrtc_configuration() -> None:
-    """Normal video uses HA's player; calls use HA's advertised ICE setup."""
+def test_card_uses_ha_hls_fallback_and_webrtc_configuration() -> None:
+    """Normal video uses HA HLS; calls use HA's advertised ICE setup."""
     card = (COMPONENT_DIR / "www" / "comelit-intercom-card.js").read_text(
         encoding="utf-8"
     )
 
-    assert 'type: "picture-entity"' in card
-    assert 'camera_view: "live"' in card
+    assert 'customElements.whenDefined("ha-hls-player")' in card
+    assert 'document.createElement("ha-hls-player")' in card
+    assert "stream.allowExoPlayer = true" in card
     assert "window.loadCardHelpers" in card
     assert 'type: "camera/webrtc/get_client_config"' in card
     assert "new RTCPeerConnection(clientConfig.configuration)" in card
     assert "event.candidate.toJSON()" in card
     assert 'sdpMid: "0"' in card
+    assert "Two-way audio needs a direct WebRTC route" in card
 
 
 def test_card_cache_version_matches_integration_version() -> None:

@@ -20,6 +20,7 @@ class ComelitIntercomCard extends HTMLElement {
     this._mountingNativeStream = false;
     this._failureReason = null;
     this._videoLoaded = false;
+    this._connectionTimer = null;
   }
 
   static getStubConfig() {
@@ -113,37 +114,47 @@ class ComelitIntercomCard extends HTMLElement {
 
     this._mountingNativeStream = true;
     try {
-      // Embed HA's official live picture card. It owns WebRTC/HLS fallback,
-      // ICE negotiation, and Companion App routing instead of duplicating
-      // those version-sensitive details here.
+      // Use HA's official HLS player explicitly for receive-only viewing.
+      // WebRTC media cannot traverse common HTTP-only remote tunnels, while
+      // HLS stays on HA's authenticated HTTP path in browsers and apps.
+      // Two-way calls switch to the WebRTC player below because a microphone
+      // backchannel fundamentally requires a bidirectional real-time route.
       if (!window.loadCardHelpers) {
         throw new Error("Home Assistant's card helpers are unavailable");
       }
       const helpers = await window.loadCardHelpers();
       const container = this.shadowRoot?.getElementById("native-stream");
       if (!container) return;
-      const stream = await helpers.createCardElement({
+      // The picture card prefers WebRTC and waits 30 seconds before giving
+      // up when ICE is unreachable. ha-hls-player is the supported HA player
+      // for forcing the HTTP fallback without maintaining our own hls.js.
+      // Creating (but not mounting) HA's picture card loads the camera-player
+      // module on frontend versions where ha-hls-player is lazy-loaded.
+      await helpers.createCardElement({
         type: "picture-entity",
         entity: this._config.entity,
-        camera_view: "live",
-        show_name: false,
-        show_state: false,
-        fit_mode: "contain",
       });
+      await customElements.whenDefined("ha-hls-player");
+      const stream = document.createElement("ha-hls-player");
       stream.hass = this._hass;
-      stream.style.setProperty("--ha-card-border-width", "0");
-      stream.style.setProperty("--ha-card-border-radius", "0");
-      stream.addEventListener("load", () => this._status("Live"));
+      stream.entityid = this._config.entity;
+      stream.autoPlay = true;
+      stream.playsInline = true;
+      stream.muted = true;
+      stream.allowExoPlayer = true;
+      stream.addEventListener("load", () => {
+        this._status(this._failureReason || "Live");
+      });
       stream.addEventListener("streams", (event) => {
         if (event.detail?.hasVideo === false) {
           this._status("Live video unavailable; showing the latest image");
         } else if (event.detail?.hasVideo) {
-          this._status("Live");
+          this._status(this._failureReason || "Live");
         }
       });
       container.replaceChildren(stream);
       this._nativeStream = stream;
-      this._status("Connecting video…");
+      if (!this._failureReason) this._status("Connecting video…");
     } catch (error) {
       this._status(error.message || "Unable to load Home Assistant's camera player");
     } finally {
@@ -293,6 +304,8 @@ class ComelitIntercomCard extends HTMLElement {
         if (!this._pc) return;
         this._status(this._pc.connectionState);
         if (this._pc.connectionState === "connected") {
+          clearTimeout(this._connectionTimer);
+          this._connectionTimer = null;
           this._connected = true;
           const call = this.shadowRoot.getElementById("connect");
           call.disabled = false;
@@ -302,7 +315,9 @@ class ComelitIntercomCard extends HTMLElement {
           mic.disabled = false;
           mic.title = "Mute or unmute your microphone";
         } else if (this._pc.connectionState === "failed") {
-          await this._fail("The two-way audio connection failed; live video has been restored.");
+          await this._fail(
+            "Two-way audio could not establish a WebRTC route. Live video has been restored.",
+          );
         }
       };
       this._pc.oniceconnectionstatechange = () => {
@@ -332,6 +347,14 @@ class ComelitIntercomCard extends HTMLElement {
           offer: offer.sdp,
         },
       );
+      this._connectionTimer = setTimeout(() => {
+        if (!this._connected && this._pc) {
+          this._fail(
+            "Two-way audio needs a direct WebRTC route to Home Assistant. " +
+            "Live video has been restored; retry on the local network or through a TURN relay.",
+          );
+        }
+      }, 12000);
     } catch (error) {
       await this._fail(error.message || "Unable to start the intercom session.");
     }
@@ -416,6 +439,8 @@ class ComelitIntercomCard extends HTMLElement {
     this._mic = null;
     this._sessionId = null;
     this._pendingCandidates = [];
+    clearTimeout(this._connectionTimer);
+    this._connectionTimer = null;
     const mic = this.shadowRoot?.getElementById("mic");
     if (mic) {
       mic.disabled = true;

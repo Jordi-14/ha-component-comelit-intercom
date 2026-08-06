@@ -34,9 +34,14 @@ Do not mix files from different releases.
 - Existing door entities and entity IDs remain unchanged.
 - Every configured door has a separate working button.
 - Opening the bundled card starts video without enabling exterior audio.
+- Receive-only video works in browsers and the Companion app through HA's HLS
+  path, including through HTTP-only remote tunnels.
 - The exterior-audio switch enables and ends the audio call.
 - The microphone starts muted and its toggle works in both a browser and the
   Home Assistant Companion app.
+- When testing two-way audio remotely, Home Assistant must have a reachable
+  WebRTC path (for example a TURN relay); an HTTP-only tunnel carries HLS but
+  cannot carry the WebRTC media connection.
 - A doorbell press creates a `ring` event and makes the inbound video available.
 - Opening the Comelit app during an HA session ends the HA stream with a clear
   `call_ended` event and notification.
