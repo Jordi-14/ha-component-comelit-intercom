@@ -16,10 +16,11 @@ from homeassistant.components import persistent_notification
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_TOKEN
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from .comelit_client import IconaBridgeClient as LegacyDoorClient
 from .const import CONF_ENABLE_NOTIFICATIONS, DEFAULT_PORT, DOMAIN
 from .control_discovery import CONTROL_TYPE_ACTUATOR, control_identity
 from .video.auth import authenticate
@@ -27,8 +28,7 @@ from .video.channels import ChannelType
 from .video.client import IconaBridgeClient
 from .video.config_reader import get_device_config
 from .video.ctpp import _CTR_INCR_BOTH, ctpp_init_sequence
-from .video.door import open_door
-from .video.exceptions import AuthenticationError, DoorOpenError
+from .video.exceptions import AuthenticationError
 from .video.models import DeviceConfig, Door, PushEvent
 from .video.push import register_push, send_push_keepalive
 from .video.rtsp_server import LocalRtspServer
@@ -365,38 +365,48 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 _LOGGER.exception("Error in push callback")
 
     async def async_open_door(self, door: Door) -> None:
-        """Open a door.
-
-        Three paths depending on what CTPP channel is currently open:
-
-        1. Video active — send a single 0x1840/0x000D on the video CTPP channel
-           (PCAP-verified Android app behaviour; no new channel or 6-step sequence).
-        2. VIP listener has CTPP open (notifications ON, no video) — reuse it,
-           fire OPEN_DOOR + CONFIRM directly (~30ms, no init overhead).
-        3. No CTPP open (notifications OFF) — open a transient CTPP channel,
-           run full init, send commands, close channel.
-        """
-        if not self._config or not self._client:
+        """Open a door using the dedicated path proven by the original fork."""
+        if not self._config or not self._config.raw:
             raise RuntimeError("Not connected")
-        if self._video_session and self._video_session.active:
-            our_addr = f"{self._config.apt_address}{self._config.apt_subaddress}"
-            # A system can expose multiple controls with the same relay index
-            # on different entrance panels.  The active-call command carries
-            # both the relay and its panel address; using the first configured
-            # entrance for every button made those controls indistinguishable.
-            entrance_addr = door.apt_address or self._config.caller_address or our_addr
-            await self._video_session.async_open_door_on_ctpp(
-                our_addr, entrance_addr, door.output_index, door.name
-            )
-        else:
-            try:
-                await open_door(
-                    self.host, self.port, self.token, self._client, self._config, door
+        vip = self._config.raw.get("vip")
+        if not isinstance(vip, dict):
+            raise HomeAssistantError("Comelit VIP configuration is unavailable")
+
+        control: dict[str, object] = {
+            "name": door.name,
+            "control-type": CONTROL_TYPE_ACTUATOR if door.is_actuator else "door",
+            "apt-address": door.apt_address,
+            "output-index": door.output_index,
+            "module-index": door.module_index,
+            "secure-mode": door.secure_mode,
+        }
+        door_client = LegacyDoorClient(self.host, self.port)
+        try:
+            await door_client.connect()
+            auth_code = await door_client.authenticate(self.token)
+            if auth_code != 200:
+                raise HomeAssistantError(
+                    f"Comelit authentication failed with code {auth_code}"
                 )
-            except DoorOpenError as err:
-                if isinstance(err.__cause__, AuthenticationError):
-                    self.config_entry.async_start_reauth(self.hass)  # type: ignore[union-attr]
-                raise
+            if door.is_actuator:
+                await door_client.open_actuator(vip, control)
+            else:
+                await door_client.open_door(vip, control)
+            _LOGGER.info(
+                "Door '%s' opened with dedicated legacy sequence "
+                "(target=%s, output=%d)",
+                door.name,
+                door.apt_address,
+                door.output_index,
+            )
+        except HomeAssistantError:
+            raise
+        except Exception as err:
+            raise HomeAssistantError(
+                f"Failed to open {door.name or 'Comelit control'}: {err}"
+            ) from err
+        finally:
+            await door_client.shutdown()
         self._on_push_event(
             PushEvent(
                 event_type="door_opened",

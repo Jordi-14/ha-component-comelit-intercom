@@ -1,5 +1,7 @@
 """Tests for the split video and exterior-audio lifecycle."""
 
+# ruff: noqa: E402
+
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +11,7 @@ import struct
 import sys
 import types
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -49,6 +51,7 @@ _package("custom_components", COMPONENT_DIR.parent)
 _package("custom_components.comelit_intercom", COMPONENT_DIR)
 _package("custom_components.comelit_intercom.video", COMPONENT_DIR / "video")
 
+from custom_components.comelit_intercom import coordinator as coordinator_module
 from custom_components.comelit_intercom.video.channels import (  # noqa: E402
     Channel,
     ChannelType,
@@ -58,6 +61,10 @@ from custom_components.comelit_intercom.video.client import (  # noqa: E402
 )
 from custom_components.comelit_intercom.video.exceptions import (  # noqa: E402
     VideoCallError,
+)
+from custom_components.comelit_intercom.video.models import (  # noqa: E402
+    DeviceConfig,
+    Door,
 )
 from custom_components.comelit_intercom.video.rtp_receiver import (  # noqa: E402
     RtpReceiver,
@@ -69,6 +76,51 @@ from custom_components.comelit_intercom.video.rtsp_server import (  # noqa: E402
 from custom_components.comelit_intercom.video.video_call import (  # noqa: E402
     VideoCallSession,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_actuator", [False, True])
+async def test_door_buttons_use_proven_dedicated_legacy_sequence(
+    is_actuator: bool,
+) -> None:
+    """Video state must not replace the door sequence that works on the device."""
+    coordinator = coordinator_module.ComelitDataUpdateCoordinator.__new__(
+        coordinator_module.ComelitDataUpdateCoordinator
+    )
+    coordinator.host = "192.0.2.1"
+    coordinator.port = 64100
+    coordinator.token = "token"
+    coordinator._config = DeviceConfig(
+        raw={"vip": {"apt-address": "SB000001", "apt-subaddress": 1}}
+    )
+    coordinator._on_push_event = MagicMock()
+    door = Door(
+        id=1,
+        index=1,
+        name="Gate" if is_actuator else "Entrance",
+        apt_address="SBIO0255" if is_actuator else "SB100001",
+        output_index=1,
+        is_actuator=is_actuator,
+    )
+    client = MagicMock()
+    client.connect = AsyncMock()
+    client.authenticate = AsyncMock(return_value=200)
+    client.open_door = AsyncMock()
+    client.open_actuator = AsyncMock()
+    client.shutdown = AsyncMock()
+
+    with patch.object(coordinator_module, "LegacyDoorClient", return_value=client):
+        await coordinator.async_open_door(door)
+
+    client.connect.assert_awaited_once()
+    client.authenticate.assert_awaited_once_with("token")
+    if is_actuator:
+        client.open_actuator.assert_awaited_once()
+        client.open_door.assert_not_awaited()
+    else:
+        client.open_door.assert_awaited_once()
+        client.open_actuator.assert_not_awaited()
+    client.shutdown.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -189,24 +241,36 @@ def test_card_uses_separate_autoplay_safe_media_elements() -> None:
 
 
 def test_card_uses_low_latency_video_with_hls_fallback() -> None:
-    """Normal video prefers WebRTC but retains an explicit HLS fallback."""
+    """Normal video uses the proven signaling path with an HLS fallback."""
     card = (COMPONENT_DIR / "www" / "comelit-intercom-card.js").read_text(
         encoding="utf-8"
     )
 
     assert 'customElements.whenDefined("ha-hls-player")' in card
-    assert 'customElements.whenDefined("ha-web-rtc-player")' in card
-    assert 'document.createElement("ha-web-rtc-player")' in card
     assert 'document.createElement("ha-hls-player")' in card
     assert "stream.allowExoPlayer = true" in card
     assert "this._mountHlsStream" in card
-    assert "}, 8000);" in card
+    assert "await this._connect(false)" in card
+    assert "callMode ? 12000 : 8000" in card
     assert "window.loadCardHelpers" in card
     assert 'type: "camera/webrtc/get_client_config"' in card
     assert "new RTCPeerConnection(clientConfig.configuration)" in card
     assert "event.candidate.toJSON()" in card
     assert 'sdpMid: "0"' in card
     assert "Two-way audio needs a direct WebRTC route" in card
+
+
+def test_card_allows_receive_only_call_on_insecure_local_app_url() -> None:
+    """A local HTTP app URL must disable only its microphone, not call mode."""
+    card = (COMPONENT_DIR / "www" / "comelit-intercom-card.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "window.isSecureContext" not in card
+    assert "await this._setCall(true)" in card
+    assert 'this._pc.addTransceiver("audio", { direction: "recvonly" })' in card
+    assert 'mic.textContent = this._mic ? "MIC ON" : "MIC UNAVAILABLE"' in card
+    assert "this._micEnabled = true" in card
 
 
 def test_card_cache_version_matches_integration_version() -> None:

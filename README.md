@@ -104,13 +104,15 @@ door_entities:
   - button.comelit_intercom_gate
 ```
 
-Opening the card prefers Home Assistant's low-latency WebRTC player and falls
-back automatically to authenticated HLS when the browser or Companion app cannot
+Opening the card prefers the bundled low-latency WebRTC path and falls back
+automatically to authenticated HLS when the browser or Companion app cannot
 establish a WebRTC media route. The call toggle enables or ends exterior audio.
-Once enabled, the microphone button mutes or unmutes your browser/app microphone
-independently. Microphone access requires Home Assistant to be opened over HTTPS.
-Two-way audio also requires a working WebRTC route to Home Assistant (local
-access or a TURN relay when the HTTPS endpoint is behind an HTTP-only tunnel).
+A new call starts with the microphone on, matching the Comelit app, and the
+microphone button can mute it independently. If a Companion app local URL is
+HTTP, call mode and exterior audio remain available but the microphone is marked
+unavailable. Microphone transmission requires a secure URL. Two-way audio also
+requires a working WebRTC route to Home Assistant (local access or a TURN relay
+when the HTTPS endpoint is behind an HTTP-only tunnel).
 
 Video lifecycle is automatic: opening the card starts an outbound view, ending
 exterior audio restores a receive-only view, and an incoming ring is handled by

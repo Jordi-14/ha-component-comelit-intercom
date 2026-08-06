@@ -38,8 +38,9 @@ Do not mix files from different releases.
   app, falls back to HLS within eight seconds when necessary, and never requires
   separate start/stop controls.
 - The exterior-audio switch enables and ends the audio call.
-- The microphone starts muted and its toggle works in both a browser and the
-  Home Assistant Companion app.
+- The microphone starts on and its mute toggle works in both a browser and the
+  Home Assistant Companion app. On an HTTP local app URL, call mode still opens
+  receive-only and labels only the microphone unavailable.
 - When testing two-way audio remotely, Home Assistant must have a reachable
   WebRTC path (for example a TURN relay); an HTTP-only tunnel carries HLS but
   cannot carry the WebRTC media connection.

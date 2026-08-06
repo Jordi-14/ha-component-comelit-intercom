@@ -130,6 +130,7 @@ class RtpReceiver:
         self._audio_sender_req_id: int = 0
         self._audio_tcp_sender: Callable[[bytes], Awaitable[None]] | None = None
         self._audio_sent_count: int = 0
+        self._microphone_frame_count: int = 0
 
         # Fires as soon as the first video NAL has been queued — callers can
         # await this to know that video is actually flowing before reporting
@@ -262,6 +263,12 @@ class RtpReceiver:
                 if self._backchannel_queue is not None:
                     with contextlib.suppress(asyncio.QueueEmpty):
                         payload = self._backchannel_queue.get_nowait()
+                        self._microphone_frame_count += 1
+                        if self._microphone_frame_count == 1:
+                            _LOGGER.info(
+                                "Microphone audio flowing to panel over %s",
+                                "TCP" if self._audio_tcp_sender else "UDP",
+                            )
                 rtp_header = struct.pack(
                     ">BBHII",
                     0x80,  # V=2, P=0, X=0, CC=0
@@ -283,7 +290,10 @@ class RtpReceiver:
         except asyncio.CancelledError:
             pass
         except Exception:
-            _LOGGER.warning("Panel audio sender stopped unexpectedly", exc_info=True)
+            _LOGGER.debug(
+                "Panel audio sender paused while its RTPC lease renews",
+                exc_info=True,
+            )
 
     @property
     def audio_sent_count(self) -> int:
