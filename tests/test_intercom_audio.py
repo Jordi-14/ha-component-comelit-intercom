@@ -273,6 +273,18 @@ def test_card_allows_receive_only_call_on_insecure_local_app_url() -> None:
     assert "this._micEnabled = true" in card
 
 
+def test_card_reports_phone_and_browser_audio_transport_state() -> None:
+    """The card distinguishes microphone capture from actual RTP transport."""
+    card = (COMPONENT_DIR / "www" / "comelit-intercom-card.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "await pc.getStats()" in card
+    assert "waiting for microphone transmission" in card
+    assert "microphone transmitting; waiting for exterior audio" in card
+    assert "two-way audio active" in card
+
+
 def test_card_cache_version_matches_integration_version() -> None:
     """Every beta must force HA to load the matching bundled card asset."""
     manifest = json.loads((COMPONENT_DIR / "manifest.json").read_text(encoding="utf-8"))
@@ -300,24 +312,35 @@ def test_rtsp_is_video_only_until_two_way_audio_is_enabled() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tcp_media_router_reads_exterior_audio_from_app_rtpc1() -> None:
-    """Panel audio is received on app-opened RTPC1, not panel-opened RTPC."""
-    audio_channel = Channel(
+@pytest.mark.parametrize("source_name", ["RTPC", "RTPC_DEVICE"])
+async def test_tcp_media_router_reads_both_exterior_audio_paths(
+    source_name: str,
+) -> None:
+    """Panel audio is accepted on either firmware-dependent RTPC downlink."""
+    app_audio_channel = Channel(
         name="RTPC",
         channel_type=ChannelType.UAUT,
         request_id=1,
         server_channel_id=2,
         is_open=True,
     )
+    device_audio_channel = Channel(
+        name="RTPC_DEVICE",
+        channel_type=ChannelType.UAUT,
+        request_id=0,
+        server_channel_id=3,
+        is_open=True,
+    )
     video_channel = Channel(
         name="RTPC2",
         channel_type=ChannelType.UAUT,
-        request_id=3,
-        server_channel_id=4,
+        request_id=4,
+        server_channel_id=5,
         is_open=True,
     )
     audio_rtp = struct.pack("!BBHII", 0x80, 8, 1, 160, 1234) + b"\xd5" * 160
-    audio_channel.response_queue.put_nowait(audio_rtp)
+    source = app_audio_channel if source_name == "RTPC" else device_audio_channel
+    source.response_queue.put_nowait(audio_rtp)
     receiver = MagicMock()
     receiver.running = True
 
@@ -328,7 +351,11 @@ async def test_tcp_media_router_reads_exterior_audio_from_app_rtpc1() -> None:
     receiver.receive_tcp_rtp.side_effect = receive
 
     await VideoCallSession._tcp_media_router(
-        MagicMock(), audio_channel, video_channel, receiver
+        MagicMock(),
+        app_audio_channel,
+        device_audio_channel,
+        video_channel,
+        receiver,
     )
 
     receiver.receive_tcp_rtp.assert_called_once_with(audio_rtp)

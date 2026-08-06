@@ -523,7 +523,7 @@ class VideoCallSession:
             # wait are ACKed instead of lingering in the channel buffer.
             self._call_counter = call_counter
             self._tcp_task = asyncio.create_task(
-                self._tcp_media_router(client, rtpc1, rtpc2, receiver)
+                self._tcp_media_router(client, rtpc1, device_rtpc, rtpc2, receiver)
             )
             self._ctpp_task = asyncio.create_task(
                 self._ctpp_monitor_loop(
@@ -906,7 +906,13 @@ class VideoCallSession:
             rtpc2 = client.get_channel("RTPC2")
             if rtpc1 and rtpc2:
                 self._tcp_task = asyncio.create_task(
-                    self._tcp_media_router(client, rtpc1, rtpc2, self._rtp_receiver)
+                    self._tcp_media_router(
+                        client,
+                        rtpc1,
+                        device_rtpc,
+                        rtpc2,
+                        self._rtp_receiver,
+                    )
                 )
         call_counter = await self._ack_device_rtpc_link(
             client, ctpp, our_addr, entrance_addr, call_counter
@@ -1288,7 +1294,7 @@ class VideoCallSession:
 
             # Step 17: Start TCP media router — device sends video (RTPC2) + audio (RTPC1) via TCP
             self._tcp_task = asyncio.create_task(
-                self._tcp_media_router(client, rtpc1, rtpc2, receiver)
+                self._tcp_media_router(client, rtpc1, device_rtpc, rtpc2, receiver)
             )
             self._call_counter = call_counter
             self._ctpp_task = asyncio.create_task(
@@ -1375,23 +1381,34 @@ class VideoCallSession:
     @staticmethod
     async def _tcp_media_router(
         client: IconaBridgeClient,
-        audio_channel: Channel,
+        app_audio_channel: Channel,
+        device_audio_channel: Channel,
         video_channel: Channel,
         receiver: RtpReceiver,
     ) -> None:
-        """Route TCP RTP from app-opened RTPC1 (audio) and RTPC2 (video).
+        """Route TCP RTP from both audio paths and RTPC2 video.
 
-        The panel-created RTPC channel is the opposite direction: HA writes
-        microphone RTP to it. Reading that channel instead of the app-opened
-        RTPC1 leaves exterior audio queued forever. The client strips the
-        ICONA header, so queued media is raw RTP.
+        Comelit firmware consistently sends video on app-opened RTPC2. Audio
+        direction differs across firmware/call state: RTPC1 is the advertised
+        downlink, while some panels return audio on the same panel-opened RTPC
+        used for microphone RTP. Read both so the latter does not queue unread.
+        The client strips the ICONA header, so queued media is raw RTP.
         """
+        first_packet_channels: set[str] = set()
         try:
             while receiver.running:
-                for ch in (audio_channel, video_channel):
+                for ch in (app_audio_channel, device_audio_channel, video_channel):
                     try:
                         data = ch.response_queue.get_nowait()
                         if len(data) >= 12:
+                            if ch.name not in first_packet_channels:
+                                first_packet_channels.add(ch.name)
+                                _LOGGER.info(
+                                    "Panel RTP received on %s (PT=%d, %d bytes)",
+                                    ch.name,
+                                    data[1] & 0x7F,
+                                    len(data),
+                                )
                             receiver.receive_tcp_rtp(data)
                     except asyncio.QueueEmpty:
                         pass

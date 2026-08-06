@@ -21,6 +21,7 @@ class ComelitIntercomCard extends HTMLElement {
     this._failureReason = null;
     this._videoLoaded = false;
     this._connectionTimer = null;
+    this._mediaStatsTimer = null;
     this._callMode = false;
     this._preferHls = false;
     this._micUnavailableReason = null;
@@ -367,6 +368,12 @@ class ComelitIntercomCard extends HTMLElement {
               ? "Mute or unmute your microphone"
               : this._micUnavailableReason;
             mic.classList.toggle("active", Boolean(this._mic));
+            clearInterval(this._mediaStatsTimer);
+            this._mediaStatsTimer = setInterval(
+              () => this._updateMediaStatus(),
+              3000,
+            );
+            this._updateMediaStatus();
           }
         } else if (this._pc.connectionState === "failed") {
           await this._fail(
@@ -430,6 +437,47 @@ class ComelitIntercomCard extends HTMLElement {
       session_id: this._sessionId,
       candidate,
     });
+  }
+
+  async _updateMediaStatus() {
+    const pc = this._pc;
+    if (!pc || !this._callMode || pc.connectionState !== "connected") return;
+    const micTrack = this._mic?.getAudioTracks()[0];
+    if (!micTrack) {
+      this._status(`Live — ${this._micUnavailableReason || "microphone unavailable"}`);
+      return;
+    }
+    if (micTrack.readyState !== "live" || micTrack.muted) {
+      this._status("Live — microphone capture interrupted by this device");
+      return;
+    }
+    try {
+      const stats = await pc.getStats();
+      if (this._pc !== pc) return;
+      let microphoneBytes = 0;
+      let exteriorBytes = 0;
+      stats.forEach((report) => {
+        const kind = report.kind || report.mediaType;
+        if (kind !== "audio") return;
+        if (report.type === "outbound-rtp") {
+          microphoneBytes += Number(report.bytesSent || 0);
+        } else if (report.type === "inbound-rtp") {
+          exteriorBytes += Number(report.bytesReceived || 0);
+        }
+      });
+      if (!this._micEnabled) {
+        this._status("Live — microphone muted");
+      } else if (!microphoneBytes) {
+        this._status("Live — waiting for microphone transmission");
+      } else if (!exteriorBytes) {
+        this._status("Live — microphone transmitting; waiting for exterior audio");
+      } else {
+        this._status("Live — two-way audio active");
+      }
+    } catch (_error) {
+      // Some embedded WebViews do not expose WebRTC statistics. The media
+      // session remains usable; backend logs still report received RTP.
+    }
   }
 
   async _onSignal(message) {
@@ -506,6 +554,8 @@ class ComelitIntercomCard extends HTMLElement {
     this._pendingCandidates = [];
     clearTimeout(this._connectionTimer);
     this._connectionTimer = null;
+    clearInterval(this._mediaStatsTimer);
+    this._mediaStatsTimer = null;
     const mic = this.shadowRoot?.getElementById("mic");
     if (mic) {
       mic.disabled = true;

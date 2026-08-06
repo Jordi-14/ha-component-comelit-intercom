@@ -22,7 +22,7 @@ PLATFORMS: list[Platform] = [
 ]
 CARD_URL = "/comelit_intercom/comelit-intercom-card.js"
 CARD_PATH = str(Path(__file__).parent / "www" / "comelit-intercom-card.js")
-CARD_VERSION = "1.2.0b15"
+CARD_VERSION = "1.2.0b16"
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
