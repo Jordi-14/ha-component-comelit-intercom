@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import struct
 import sys
@@ -52,6 +51,9 @@ _package("custom_components.comelit_intercom", COMPONENT_DIR)
 _package("custom_components.comelit_intercom.video", COMPONENT_DIR / "video")
 
 from custom_components.comelit_intercom import coordinator as coordinator_module
+from custom_components.comelit_intercom.camera import (  # noqa: E402
+    ComelitIntercomCamera,
+)
 from custom_components.comelit_intercom.video.channels import (  # noqa: E402
     Channel,
     ChannelType,
@@ -125,6 +127,145 @@ async def test_door_buttons_use_proven_dedicated_legacy_sequence(
         client.open_door.assert_awaited_once()
         client.open_actuator.assert_not_awaited()
     client.shutdown.assert_awaited_once()
+
+
+def _camera_coordinator() -> MagicMock:
+    """Return the minimum coordinator contract required by the camera entity."""
+    coordinator = MagicMock()
+    coordinator.entry.unique_id = "test-entry"
+    coordinator.host = "192.0.2.1"
+    coordinator.video_session = None
+    coordinator.video_session_purpose = None
+    coordinator.rtsp_server = None
+    coordinator.rtsp_url = "rtsp://127.0.0.1:12345/intercom"
+    return coordinator
+
+
+@pytest.mark.asyncio
+async def test_camera_uses_a_cached_still_without_reopening_the_panel() -> None:
+    """Dashboard image polling reuses a JPEG during the cache interval."""
+    coordinator = _camera_coordinator()
+    jpeg = b"\xff\xd8current-still\xff\xd9"
+    coordinator.async_capture_video_snapshot = AsyncMock(return_value=jpeg)
+    camera = ComelitIntercomCamera(coordinator)
+
+    assert await camera.async_camera_image() == jpeg
+    assert await camera.async_camera_image() == jpeg
+
+    coordinator.async_capture_video_snapshot.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_camera_live_view_starts_without_video_buttons() -> None:
+    """Opening the native camera dialog starts a viewer-owned live session."""
+    coordinator = _camera_coordinator()
+    coordinator.async_start_video = AsyncMock()
+    camera = ComelitIntercomCamera(coordinator)
+
+    try:
+        assert await camera.stream_source() == coordinator.rtsp_url
+    finally:
+        camera._cancel_live_stop()
+
+    coordinator.async_start_video.assert_awaited_once_with(
+        auto_timeout=False,
+        by_user=True,
+        purpose=coordinator_module.VIDEO_PURPOSE_LIVE,
+    )
+
+
+@pytest.mark.asyncio
+async def test_camera_releases_live_video_after_viewer_closes() -> None:
+    """The panel is released automatically instead of requiring Stop video."""
+    coordinator = _camera_coordinator()
+    coordinator.video_session_purpose = coordinator_module.VIDEO_PURPOSE_LIVE
+    coordinator.async_release_live_video = AsyncMock()
+    camera = ComelitIntercomCamera(coordinator)
+
+    await camera._async_stop_live_after(0)
+
+    coordinator.async_release_live_video.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_live_request_promotes_snapshot_session() -> None:
+    """A click during still capture reuses the negotiated panel session."""
+    coordinator = coordinator_module.ComelitDataUpdateCoordinator.__new__(
+        coordinator_module.ComelitDataUpdateCoordinator
+    )
+    coordinator._config = MagicMock()
+    coordinator._client = MagicMock()
+    coordinator._video_start_lock = asyncio.Lock()
+    session = MagicMock(active=True)
+    coordinator._video_session = session
+    coordinator._video_session_purpose = coordinator_module.VIDEO_PURPOSE_SNAPSHOT
+
+    result = await coordinator.async_start_video(
+        auto_timeout=False,
+        by_user=True,
+        purpose=coordinator_module.VIDEO_PURPOSE_LIVE,
+    )
+
+    assert result is session
+    assert coordinator.video_session_purpose == coordinator_module.VIDEO_PURPOSE_LIVE
+
+
+@pytest.mark.asyncio
+async def test_short_snapshot_session_is_released_after_one_frame() -> None:
+    """A still capture does not leave the intercom media channel occupied."""
+    coordinator = coordinator_module.ComelitDataUpdateCoordinator.__new__(
+        coordinator_module.ComelitDataUpdateCoordinator
+    )
+    jpeg = b"\xff\xd8snapshot\xff\xd9"
+    receiver = MagicMock(latest_frame=jpeg)
+    session = MagicMock(rtp_receiver=receiver)
+    coordinator._video_start_lock = asyncio.Lock()
+    coordinator._video_session = session
+    coordinator._video_session_purpose = coordinator_module.VIDEO_PURPOSE_SNAPSHOT
+    coordinator.async_start_video = AsyncMock(return_value=session)
+    coordinator.async_stop_video = AsyncMock()
+    coordinator._ensure_vip_listener = AsyncMock()
+
+    assert await coordinator.async_capture_video_snapshot() == jpeg
+
+    coordinator.async_stop_video.assert_awaited_once_with(reason="snapshot captured")
+    coordinator._ensure_vip_listener.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_short_snapshot_session_is_released_without_a_receiver() -> None:
+    """An incomplete still session must not leave the intercom occupied."""
+    coordinator = coordinator_module.ComelitDataUpdateCoordinator.__new__(
+        coordinator_module.ComelitDataUpdateCoordinator
+    )
+    session = MagicMock(rtp_receiver=None)
+    coordinator._video_start_lock = asyncio.Lock()
+    coordinator._video_session = session
+    coordinator._video_session_purpose = coordinator_module.VIDEO_PURPOSE_SNAPSHOT
+    coordinator.async_start_video = AsyncMock(return_value=session)
+    coordinator.async_stop_video = AsyncMock()
+    coordinator._ensure_vip_listener = AsyncMock()
+
+    assert await coordinator.async_capture_video_snapshot() is None
+
+    coordinator.async_stop_video.assert_awaited_once_with(reason="snapshot captured")
+    coordinator._ensure_vip_listener.assert_awaited_once()
+
+
+def test_integration_exposes_native_camera_and_original_door_buttons() -> None:
+    """This beta keeps doors but drops calls, events, and the custom card."""
+    setup_source = (COMPONENT_DIR / "__init__.py").read_text(encoding="utf-8")
+    assert "PLATFORMS: list[Platform] = [Platform.BUTTON, Platform.CAMERA]" in (
+        setup_source
+    )
+    assert "_remove_obsolete_intercom_entities" in setup_source
+    button_source = (COMPONENT_DIR / "button.py").read_text(encoding="utf-8")
+    assert "ComelitDoorButton" in button_source
+    assert "ComelitStartVideoButton" not in button_source
+    assert "ComelitStopVideoButton" not in button_source
+    assert not (COMPONENT_DIR / "event.py").exists()
+    assert not (COMPONENT_DIR / "switch.py").exists()
+    assert not (COMPONENT_DIR / "www" / "comelit-intercom-card.js").exists()
 
 
 @pytest.mark.asyncio
@@ -231,71 +372,6 @@ async def test_video_client_redacts_authentication_token(
     assert token not in caplog.text
     assert "<redacted>" in caplog.text
     assert b"<redacted>" not in writer.write.call_args.args[0]
-
-
-def test_card_uses_separate_autoplay_safe_media_elements() -> None:
-    """An incoming audio track must not block muted video autoplay."""
-    card = (COMPONENT_DIR / "www" / "comelit-intercom-card.js").read_text(
-        encoding="utf-8"
-    )
-
-    assert '<video id="call-video" autoplay playsinline muted hidden>' in card
-    assert "<audio autoplay playsinline muted>" in card
-    assert 'event.track.kind === "video" ? video : audio' in card
-    assert "video.play().catch" in card
-
-
-def test_card_uses_low_latency_video_with_hls_fallback() -> None:
-    """Normal video uses the proven signaling path with an HLS fallback."""
-    card = (COMPONENT_DIR / "www" / "comelit-intercom-card.js").read_text(
-        encoding="utf-8"
-    )
-
-    assert 'customElements.whenDefined("ha-hls-player")' in card
-    assert 'document.createElement("ha-hls-player")' in card
-    assert "stream.allowExoPlayer = true" in card
-    assert "this._mountHlsStream" in card
-    assert "await this._connect(false)" in card
-    assert "callMode ? 12000 : 8000" in card
-    assert "window.loadCardHelpers" in card
-    assert 'type: "camera/webrtc/get_client_config"' in card
-    assert "new RTCPeerConnection(clientConfig.configuration)" in card
-    assert "event.candidate.toJSON()" in card
-    assert 'sdpMid: "0"' in card
-    assert "Two-way audio needs a direct WebRTC route" in card
-
-
-def test_card_allows_receive_only_call_on_insecure_local_app_url() -> None:
-    """A local HTTP app URL must disable only its microphone, not call mode."""
-    card = (COMPONENT_DIR / "www" / "comelit-intercom-card.js").read_text(
-        encoding="utf-8"
-    )
-
-    assert "window.isSecureContext" not in card
-    assert "await this._setCall(true)" in card
-    assert 'this._pc.addTransceiver("audio", { direction: "recvonly" })' in card
-    assert 'mic.textContent = this._mic ? "MIC ON" : "MIC UNAVAILABLE"' in card
-    assert "this._micEnabled = true" in card
-
-
-def test_card_reports_phone_and_browser_audio_transport_state() -> None:
-    """The card distinguishes microphone capture from actual RTP transport."""
-    card = (COMPONENT_DIR / "www" / "comelit-intercom-card.js").read_text(
-        encoding="utf-8"
-    )
-
-    assert "await pc.getStats()" in card
-    assert "waiting for microphone transmission" in card
-    assert "microphone transmitting; waiting for exterior audio" in card
-    assert "two-way audio active" in card
-
-
-def test_card_cache_version_matches_integration_version() -> None:
-    """Every beta must force HA to load the matching bundled card asset."""
-    manifest = json.loads((COMPONENT_DIR / "manifest.json").read_text(encoding="utf-8"))
-    init_source = (COMPONENT_DIR / "__init__.py").read_text(encoding="utf-8")
-
-    assert f'CARD_VERSION = "{manifest["version"]}"' in init_source
 
 
 def test_rtsp_is_video_only_until_two_way_audio_is_enabled() -> None:

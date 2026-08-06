@@ -1,7 +1,7 @@
 # Beta Testing
 
-Beta releases are intended for deliberate testing of camera, call signaling,
-audio, event, and dashboard behavior before a stable release.
+Beta releases are intended for deliberate testing of the camera and dashboard
+behavior before a stable release.
 
 ## Install a beta
 
@@ -31,26 +31,26 @@ Do not mix files from different releases.
 
 ## Test checklist
 
-- Existing door entities and entity IDs remain unchanged.
-- Every configured door has a separate working button.
-- Opening the bundled card starts video without enabling exterior audio.
-- Receive-only video prefers low-latency WebRTC in browsers and the Companion
-  app, falls back to HLS within eight seconds when necessary, and never requires
-  separate start/stop controls.
-- The exterior-audio switch enables and ends the audio call.
-- The microphone starts on and its mute toggle works in both a browser and the
-  Home Assistant Companion app. On an HTTP local app URL, call mode still opens
-  receive-only and labels only the microphone unavailable.
-- When testing two-way audio remotely, Home Assistant must have a reachable
-  WebRTC path (for example a TURN relay); an HTTP-only tunnel carries HLS but
-  cannot carry the WebRTC media connection.
-- A doorbell press creates a `ring` event and makes the inbound video available.
-- Opening the Comelit app during an HA session ends the HA stream with a clear
-  `call_ended` event and notification.
-- Door controls still work during and outside an active video session.
+- The integration exposes one `Live feed` camera plus the original per-door
+  opening buttons.
+- The old custom intercom card and its Lovelace resource are removed.
+- Earlier event, audio, and manual Start/Stop entities are removed from the
+  integration's entity registry on startup; existing door entities and their
+  entity IDs remain unchanged.
+- A built-in picture entity card with `camera_view: auto` shows a current still
+  without leaving a video session active.
+- Repeated still requests within 15 seconds reuse the cached JPEG.
+- Clicking the camera opens low-latency live video without any separate
+  Start/Stop controls.
+- Closing a WebRTC viewer releases the panel automatically; HLS fallback is
+  released by its safety timeout.
+- Test both a browser and the Home Assistant Companion app.
+- Verify every configured door still opens from its existing button entity.
+- Opening the Comelit app during an HA live view releases or interrupts the HA
+  stream without leaving a stuck video session.
 
 Keep the entrance visible and the official Comelit app available while testing
-call or relay behavior.
+session takeover behavior.
 
 ## Report a beta problem
 

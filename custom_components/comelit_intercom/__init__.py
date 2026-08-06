@@ -2,60 +2,45 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import entity_registry as er
 
 from .const import DOMAIN
 from .coordinator import ComelitDataUpdateCoordinator
 from .video.exceptions import AuthenticationError
 
-PLATFORMS: list[Platform] = [
-    Platform.BUTTON,
-    Platform.CAMERA,
-    Platform.EVENT,
-    Platform.SWITCH,
-]
-CARD_URL = "/comelit_intercom/comelit-intercom-card.js"
-CARD_PATH = str(Path(__file__).parent / "www" / "comelit-intercom-card.js")
-CARD_VERSION = "1.2.0b18"
+PLATFORMS: list[Platform] = [Platform.BUTTON, Platform.CAMERA]
+
+OBSOLETE_ENTITY_UNIQUE_ID_SUFFIXES = (
+    "video_start",
+    "video_stop",
+    "call_audio",
+    "doorbell",
+)
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
-    """Register the bundled Lovelace intercom card."""
-    from homeassistant.components.frontend import add_extra_js_url
-    from homeassistant.components.http import StaticPathConfig
+    """Remove the Lovelace resource bundled by earlier intercom betas."""
     from homeassistant.components.lovelace.resources import ResourceStorageCollection
 
-    await hass.http.async_register_static_paths(
-        [StaticPathConfig(CARD_URL, CARD_PATH, cache_headers=True)]
-    )
-    url = f"{CARD_URL}?v={CARD_VERSION}"
-    lovelace = hass.data["lovelace"]
+    lovelace = hass.data.get("lovelace")
+    if lovelace is None:
+        return True
     resources = (
         lovelace.resources if hasattr(lovelace, "resources") else lovelace["resources"]
     )
     await resources.async_get_info()
-    for item in resources.async_items():
-        if not item.get("url", "").startswith(CARD_URL):
-            continue
-        if item["url"] == url:
-            return True
-        if isinstance(resources, ResourceStorageCollection):
-            await resources.async_update_item(
-                item["id"], {"res_type": "module", "url": url}
-            )
-        else:
-            item["url"] = url
-        return True
     if isinstance(resources, ResourceStorageCollection):
-        await resources.async_create_item({"res_type": "module", "url": url})
-    else:
-        add_extra_js_url(hass, url)
+        for item in list(resources.async_items()):
+            if item.get("url", "").startswith(
+                "/comelit_intercom/comelit-intercom-card.js"
+            ):
+                await resources.async_delete_item(item["id"])
     return True
 
 
@@ -72,6 +57,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
+    _remove_obsolete_intercom_entities(hass, entry, coordinator.host)
 
     try:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -81,6 +67,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise
 
     return True
+
+
+def _remove_obsolete_intercom_entities(
+    hass: HomeAssistant, entry: ConfigEntry, host: str
+) -> None:
+    """Remove retired call controls while preserving camera and door buttons."""
+    registry = er.async_get(hass)
+    entry_unique_id = entry.unique_id or host
+    obsolete_unique_ids = {
+        f"{entry_unique_id}_{suffix}" for suffix in OBSOLETE_ENTITY_UNIQUE_ID_SUFFIXES
+    }
+    for entity in er.async_entries_for_config_entry(registry, entry.entry_id):
+        if entity.platform == DOMAIN and entity.unique_id in obsolete_unique_ids:
+            registry.async_remove(entity.entity_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

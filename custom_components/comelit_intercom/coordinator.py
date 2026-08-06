@@ -38,6 +38,9 @@ from .video.vip_listener import VipEventListener
 _LOGGER = logging.getLogger(__name__)
 
 UPDATE_INTERVAL = timedelta(seconds=30)
+VIDEO_PURPOSE_LIVE = "live"
+VIDEO_PURPOSE_SNAPSHOT = "snapshot"
+VIDEO_PURPOSE_INBOUND = "inbound"
 
 
 class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
@@ -64,6 +67,7 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
         self._client: IconaBridgeClient | None = None
         self._config: DeviceConfig | None = None
         self._video_session: VideoCallSession | None = None
+        self._video_session_purpose: str | None = None
         self._video_stopped_by_user: bool = False
         # Prevents concurrent async_start_video calls from racing each other.
         # The device can only handle one CTPP negotiation at a time; a second
@@ -234,6 +238,7 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
             with contextlib.suppress(Exception):
                 await self._video_session.stop(reason="reconnect")
             self._video_session = None
+            self._video_session_purpose = None
             self._video_ready_event.clear()
             if self._rtsp_server:
                 self._rtsp_server.mark_not_ready()
@@ -435,13 +440,16 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
         raise RuntimeError("Door control is no longer available")
 
     async def async_start_video(
-        self, auto_timeout: bool = True, by_user: bool = False
+        self,
+        auto_timeout: bool = True,
+        by_user: bool = False,
+        purpose: str = VIDEO_PURPOSE_LIVE,
     ) -> VideoCallSession:
         """Start a video call session.
 
-        Concurrent calls are dropped — the device can only negotiate one
-        CTPP session at a time and a second concurrent start would conflict
-        with the first and fail ~35 s later with a UDPM timeout.
+        Starts are serialized because the device can negotiate only one CTPP
+        media session at a time. A live request can promote an in-progress
+        snapshot session instead of tearing it down and negotiating again.
 
         Args:
             auto_timeout: stop the session after VIDEO_SESSION_TIMEOUT seconds.
@@ -451,19 +459,24 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
                      since stopped video (prevents a stale async_create_task
                      from overriding a user stop and causing an infinite
                      go2rtc reconnect loop).
+            purpose: ``live`` for a viewer-owned stream or ``snapshot`` for a
+                     short still-image capture.
         """
         if not self._config:
             raise RuntimeError("Not configured")
 
-        if self._video_start_lock.locked():
-            _LOGGER.debug("Video start already in progress — skipping duplicate call")
-            if self._video_session:
-                return self._video_session
-            raise RuntimeError("Video start already in progress")
-
         async with self._video_start_lock:
             if not self._client:
                 raise RuntimeError("Not connected")
+
+            if self._video_session and self._video_session.active:
+                if (
+                    purpose == VIDEO_PURPOSE_LIVE
+                    and self._video_session_purpose == VIDEO_PURPOSE_SNAPSHOT
+                ):
+                    self._video_session_purpose = VIDEO_PURPOSE_LIVE
+                    _LOGGER.debug("Snapshot session promoted to live viewing")
+                return self._video_session
 
             # Drop auto-restarts that arrive after the user has stopped video.
             # Race: _on_video_call_end schedules async_start_video() as a task;
@@ -526,10 +539,11 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
                         self._rtsp_server.backchannel_queue
                     )
                 self._video_session = session
+                self._video_session_purpose = purpose
                 # Preserve an unexpected end reason across an automatic
                 # recovery so the card can explain why the previous stream
                 # stopped. A deliberate new view starts with a clean status.
-                if by_user:
+                if by_user and purpose == VIDEO_PURPOSE_LIVE:
                     self._last_video_end_reason = None
                     self._last_video_end_at = None
                 self._video_ready_event.set()
@@ -577,7 +591,7 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
         unhandled task exception for a normal, expected situation.
         """
         try:
-            await self.async_start_video()
+            await self.async_start_video(purpose=VIDEO_PURPOSE_LIVE)
         except RuntimeError as err:
             _LOGGER.debug("Auto-restart skipped: %s", err)
         except Exception:
@@ -606,9 +620,6 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
         On failure, fires missed_call and restores the VIP listener.
         """
         if not self._config:
-            return
-        if self._video_start_lock.locked():
-            _LOGGER.debug("Inbound: video start already in progress — skipping ring")
             return
 
         async with self._video_start_lock:
@@ -660,6 +671,7 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
                     self._rtsp_server.backchannel_queue
                 )
             self._video_session = session
+            self._video_session_purpose = VIDEO_PURPOSE_INBOUND
             self._last_video_end_reason = None
             self._last_video_end_at = None
             self._video_ready_event.set()
@@ -700,7 +712,57 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
             await self.async_stop_video(reason="call audio disabled")
         finally:
             self._video_stopped_by_user = False
-        await self.async_start_video(by_user=True)
+        await self.async_start_video(by_user=True, purpose=VIDEO_PURPOSE_LIVE)
+
+    async def async_capture_video_snapshot(self) -> bytes | None:
+        """Capture and cache one frame without leaving the panel occupied.
+
+        If a live or inbound session already exists, its newest frame is used
+        and the session is left untouched. Otherwise a short receive-only
+        session is opened and released after the JPEG has been decoded. A live
+        request arriving during that negotiation promotes the same session and
+        prevents this method from closing it.
+        """
+        session = await self.async_start_video(
+            auto_timeout=False,
+            by_user=True,
+            purpose=VIDEO_PURPOSE_SNAPSHOT,
+        )
+        try:
+            receiver = session.rtp_receiver
+            if receiver is None:
+                return None
+            if receiver.latest_frame:
+                return receiver.latest_frame
+            async with asyncio.timeout(3.0):
+                return await receiver.get_jpeg_frame()
+        except TimeoutError:
+            return receiver.latest_frame
+        finally:
+            stopped_snapshot = False
+            async with self._video_start_lock:
+                if (
+                    self._video_session is session
+                    and self._video_session_purpose == VIDEO_PURPOSE_SNAPSHOT
+                ):
+                    await self.async_stop_video(reason="snapshot captured")
+                    stopped_snapshot = True
+            # async_stop_video intentionally avoids restarting the VIP listener
+            # while the start lock is held. Snapshot capture is not followed by
+            # another start, so restore the listener explicitly afterwards.
+            if stopped_snapshot:
+                await self._ensure_vip_listener()
+
+    async def async_release_live_video(self) -> None:
+        """Release a viewer-owned live session without racing a new viewer."""
+        stopped_live = False
+        async with self._video_start_lock:
+            if self._video_session_purpose == VIDEO_PURPOSE_LIVE:
+                self.request_video_stop()
+                await self.async_stop_video(reason="live viewer closed")
+                stopped_live = True
+        if stopped_live:
+            await self._ensure_vip_listener()
 
     @property
     def video_stopped_by_user(self) -> bool:
@@ -797,6 +859,7 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
         if session is None:
             return
         self._video_session = None
+        self._video_session_purpose = None
         self._video_ready_event.clear()
 
         # Tear HA's Stream worker down gracefully FIRST, before any
@@ -837,6 +900,11 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
     def video_session(self) -> VideoCallSession | None:
         """Return the active video call session, if any."""
         return self._video_session
+
+    @property
+    def video_session_purpose(self) -> str | None:
+        """Return whether the current media session serves live video or a still."""
+        return self._video_session_purpose
 
     def _on_client_disconnect(self) -> None:
         """Called by the TCP client when the connection drops unexpectedly.
