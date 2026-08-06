@@ -7,6 +7,7 @@ on:
       - master
       - dev
   pull_request:
+  workflow_dispatch:
 
 jobs:
   lint:
