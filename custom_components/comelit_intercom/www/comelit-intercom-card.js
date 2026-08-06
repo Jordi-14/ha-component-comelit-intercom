@@ -18,6 +18,7 @@ class ComelitIntercomCard extends HTMLElement {
     this._micEnabled = false;
     this._autoStarted = false;
     this._failureReason = null;
+    this._videoLoaded = false;
   }
 
   static getStubConfig() {
@@ -32,6 +33,11 @@ class ComelitIntercomCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
+    const camera = this._cameraState();
+    const video = this.shadowRoot?.querySelector("video");
+    if (video && camera?.attributes?.access_token) {
+      video.poster = `/api/camera_proxy/${this._config.entity}?token=${camera.attributes.access_token}`;
+    }
     this._refreshIdleState();
     if (this._config && !this._autoStarted) {
       this._autoStarted = true;
@@ -172,7 +178,17 @@ class ComelitIntercomCard extends HTMLElement {
         await this._setCall(true);
       }
 
-      this._pc = new RTCPeerConnection({ iceServers: [], bundlePolicy: "max-bundle" });
+      // Use the same ICE/server configuration as Home Assistant's native
+      // camera player. This is important for both browsers and companion apps,
+      // where the media route can differ from the WebSocket route to HA.
+      const clientConfig = await this._hass.callWS({
+        type: "camera/webrtc/get_client_config",
+        entity_id: this._config.entity,
+      });
+      this._pc = new RTCPeerConnection(clientConfig.configuration);
+      if (clientConfig.dataChannel) {
+        this._pc.createDataChannel(clientConfig.dataChannel);
+      }
       if (this._mic) {
         const track = this._mic.getAudioTracks()[0];
         this._pc.addTransceiver(track, { direction: "sendrecv", streams: [this._mic] });
@@ -188,6 +204,7 @@ class ComelitIntercomCard extends HTMLElement {
         media.srcObject.addTrack(event.track);
 
         if (event.track.kind === "video") {
+          this._status("Receiving video…");
           video.muted = true;
           video.play().catch(() => {
             this._status("Tap the video to start playback");
@@ -200,6 +217,10 @@ class ComelitIntercomCard extends HTMLElement {
         }
       };
       const video = this.shadowRoot.querySelector("video");
+      video.onloadeddata = () => {
+        this._videoLoaded = true;
+        this._status("Live");
+      };
       video.onclick = () => {
         video.play().catch(() => {});
         const audio = this.shadowRoot.querySelector("audio");
@@ -221,6 +242,12 @@ class ComelitIntercomCard extends HTMLElement {
           await this._fail(
             "The intercom ended this Home Assistant call. Another client, such as the Comelit app, may have taken control.",
           );
+        }
+      };
+      this._pc.oniceconnectionstatechange = () => {
+        if (this._pc?.iceConnectionState === "failed") {
+          this._status("Reconnecting video…");
+          this._pc.restartIce();
         }
       };
       this._pc.onicecandidate = async (event) => {
@@ -269,7 +296,11 @@ class ComelitIntercomCard extends HTMLElement {
     } else if (message.type === "answer") {
       await this._pc.setRemoteDescription({ type: "answer", sdp: message.answer });
     } else if (message.type === "candidate") {
-      await this._pc.addIceCandidate(message.candidate);
+      const candidate = message.candidate.sdpMid ||
+        message.candidate.sdpMLineIndex != null
+        ? message.candidate
+        : { ...message.candidate, sdpMid: "0" };
+      await this._pc.addIceCandidate(candidate);
     } else if (message.type === "error") {
       await this._fail(message.message || message.code || "Unable to start the video stream.");
     }
@@ -302,6 +333,7 @@ class ComelitIntercomCard extends HTMLElement {
   _teardown(setIdle = true) {
     this._connected = false;
     this._micEnabled = false;
+    this._videoLoaded = false;
     const video = this.shadowRoot?.querySelector("video");
     if (video?.srcObject) {
       video.srcObject.getTracks().forEach((track) => track.stop());

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import struct
 import sys
@@ -182,6 +183,26 @@ def test_card_uses_separate_autoplay_safe_media_elements() -> None:
     assert "<audio autoplay playsinline muted>" in card
     assert 'event.track.kind === "video" ? video : audio' in card
     assert "video.play().catch" in card
+
+
+def test_card_uses_home_assistant_webrtc_client_configuration() -> None:
+    """Browser and app clients must use HA's advertised ICE configuration."""
+    card = (COMPONENT_DIR / "www" / "comelit-intercom-card.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'type: "camera/webrtc/get_client_config"' in card
+    assert "new RTCPeerConnection(clientConfig.configuration)" in card
+    assert 'sdpMid: "0"' in card
+    assert "this._pc.restartIce()" in card
+
+
+def test_card_cache_version_matches_integration_version() -> None:
+    """Every beta must force HA to load the matching bundled card asset."""
+    manifest = json.loads((COMPONENT_DIR / "manifest.json").read_text(encoding="utf-8"))
+    init_source = (COMPONENT_DIR / "__init__.py").read_text(encoding="utf-8")
+
+    assert f'CARD_VERSION = "{manifest["version"]}"' in init_source
 
 
 @pytest.mark.asyncio
