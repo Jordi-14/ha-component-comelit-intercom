@@ -54,6 +54,7 @@ class ComelitIntercomCard extends HTMLElement {
         ha-card { overflow: hidden; }
         .video { position: relative; aspect-ratio: 4 / 3; background: #000; }
         video { width: 100%; height: 100%; object-fit: contain; }
+        audio { display: none; }
         .status { position: absolute; left: 10px; bottom: 10px; max-width: calc(100% - 36px);
           color: white; background: rgba(0,0,0,.7); border-radius: 6px; padding: 6px 8px;
           font-size: 12px; }
@@ -69,7 +70,8 @@ class ComelitIntercomCard extends HTMLElement {
       </style>
       <ha-card>
         <div class="video">
-          <video autoplay playsinline></video>
+          <video autoplay playsinline muted></video>
+          <audio autoplay playsinline muted></audio>
           <div class="status">Idle</div>
         </div>
         <div class="controls">
@@ -131,16 +133,18 @@ class ComelitIntercomCard extends HTMLElement {
   async _toggleCall() {
     const wasAudioCall = Boolean(this._mic);
     this._teardown(false);
-    if (wasAudioCall) {
-      this._status("Ending exterior audio…");
-      await this._setCall(false);
-      // The panel closes its old media channel asynchronously. Reopening
-      // immediately can be accepted at the signaling layer while yielding
-      // no RTP at all, so let that device-side close complete first.
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      await this._connect(false);
-    } else {
-      await this._connect(true);
+    try {
+      if (wasAudioCall) {
+        this._status("Restoring video…");
+        // The service now returns only after the old device channels are
+        // released and a fresh receive-only Comelit session is ready.
+        await this._setCall(false);
+        await this._connect(false);
+      } else {
+        await this._connect(true);
+      }
+    } catch (error) {
+      await this._fail(error.message || "Unable to change the intercom call state.");
     }
   }
 
@@ -152,6 +156,10 @@ class ComelitIntercomCard extends HTMLElement {
     this._status(withAudio ? "Requesting microphone…" : "Connecting video…");
 
     try {
+      const speaker = this.shadowRoot.querySelector("audio");
+      speaker.muted = !withAudio;
+      if (withAudio) speaker.play().catch(() => {});
+
       if (withAudio) {
         if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
           throw new Error("Microphone access requires an HTTPS Home Assistant URL");
@@ -174,8 +182,28 @@ class ComelitIntercomCard extends HTMLElement {
       this._pc.addTransceiver("video", { direction: "recvonly" });
       this._pc.ontrack = (event) => {
         const video = this.shadowRoot.querySelector("video");
-        if (!video.srcObject) video.srcObject = new MediaStream();
-        video.srcObject.addTrack(event.track);
+        const audio = this.shadowRoot.querySelector("audio");
+        const media = event.track.kind === "video" ? video : audio;
+        if (!media.srcObject) media.srcObject = new MediaStream();
+        media.srcObject.addTrack(event.track);
+
+        if (event.track.kind === "video") {
+          video.muted = true;
+          video.play().catch(() => {
+            this._status("Tap the video to start playback");
+          });
+        } else if (withAudio) {
+          audio.muted = false;
+          audio.play().catch(() => {
+            this._status("Tap the video to enable exterior audio");
+          });
+        }
+      };
+      const video = this.shadowRoot.querySelector("video");
+      video.onclick = () => {
+        video.play().catch(() => {});
+        const audio = this.shadowRoot.querySelector("audio");
+        if (!audio.muted) audio.play().catch(() => {});
       };
       this._pc.onconnectionstatechange = async () => {
         if (!this._pc) return;
@@ -279,6 +307,12 @@ class ComelitIntercomCard extends HTMLElement {
       video.srcObject.getTracks().forEach((track) => track.stop());
       video.srcObject = null;
     }
+    const audio = this.shadowRoot?.querySelector("audio");
+    if (audio?.srcObject) {
+      audio.srcObject.getTracks().forEach((track) => track.stop());
+      audio.srcObject = null;
+    }
+    if (audio) audio.muted = true;
     if (this._unsubscribe) this._unsubscribe();
     this._unsubscribe = null;
     const pc = this._pc;

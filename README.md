@@ -109,10 +109,10 @@ toggle enables or ends exterior audio. Once enabled, the microphone button mutes
 or unmutes your browser/app microphone independently. Microphone access requires
 Home Assistant to be opened over HTTPS, including in the Companion app.
 
-The Start/Stop video entities remain available as diagnostic controls for
-automations and troubleshooting. Normal dashboard use does not require pressing
-Start first: opening the card starts an outbound view, while an incoming ring is
-handled by the persistent call listener.
+Video lifecycle is automatic: opening the card starts an outbound view, ending
+exterior audio restores a receive-only view, and an incoming ring is handled by
+the persistent call listener. The diagnostic Start/Stop entities are not needed
+for normal dashboard use.
 
 ## How It Works
 

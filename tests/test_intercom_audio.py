@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import struct
 import sys
 import types
@@ -130,6 +131,57 @@ async def test_video_cleanup_closes_remote_media_channels() -> None:
         "RTPC_DEVICE_REEST",
     }
     assert session.cleanup_requires_reconnect is True
+
+
+@pytest.mark.asyncio
+async def test_video_client_redacts_authentication_token(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Debug logging must not expose the credential used by authentication."""
+    client = IconaBridgeClient("192.0.2.1")
+    writer = MagicMock()
+    writer.drain = AsyncMock()
+    client._writer = writer
+    channel = Channel(
+        name="UAUT",
+        channel_type=ChannelType.UAUT,
+        request_id=123,
+        server_channel_id=0x2104,
+        is_open=True,
+    )
+    client._channels[channel.name] = channel
+    token = "secret-token-that-must-not-be-logged"
+
+    with caplog.at_level(logging.DEBUG):
+        response_task = asyncio.create_task(
+            client.send_json(
+                channel,
+                {
+                    "message": "access",
+                    "user-token": token,
+                    "message-type": "request",
+                },
+            )
+        )
+        await asyncio.sleep(0)
+        client._dispatch(channel.server_channel_id, b'{"response-code":200}')
+        await response_task
+
+    assert token not in caplog.text
+    assert "<redacted>" in caplog.text
+    assert b"<redacted>" not in writer.write.call_args.args[0]
+
+
+def test_card_uses_separate_autoplay_safe_media_elements() -> None:
+    """An incoming audio track must not block muted video autoplay."""
+    card = (COMPONENT_DIR / "www" / "comelit-intercom-card.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "<video autoplay playsinline muted>" in card
+    assert "<audio autoplay playsinline muted>" in card
+    assert 'event.track.kind === "video" ? video : audio' in card
+    assert "video.play().catch" in card
 
 
 @pytest.mark.asyncio

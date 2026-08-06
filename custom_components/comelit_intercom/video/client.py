@@ -33,6 +33,25 @@ _LOGGER = logging.getLogger(__name__)
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT = 30
 CLOSE_TIMEOUT = 1.5
+_SENSITIVE_JSON_KEYS = frozenset({"user-token", "password"})
+
+
+def _redact_json_message(msg: dict[str, Any]) -> dict[str, Any]:
+    """Return a log-safe copy of a JSON protocol message."""
+    return {
+        key: "<redacted>" if key in _SENSITIVE_JSON_KEYS else value
+        for key, value in msg.items()
+    }
+
+
+def _format_packet_for_log(data: bytes) -> str:
+    """Format a packet without exposing authentication credentials."""
+    body = data[HEADER_SIZE:] if len(data) >= HEADER_SIZE else b""
+    if is_json_body(body) and any(
+        f'"{key}"'.encode() in body for key in _SENSITIVE_JSON_KEYS
+    ):
+        return f"{data[:HEADER_SIZE].hex(' ')} <redacted sensitive JSON payload>"
+    return data.hex(" ")
 
 
 class IconaBridgeClient:
@@ -126,7 +145,7 @@ class IconaBridgeClient:
         """Send raw bytes to the device."""
         if not self._writer:
             raise ConnectionComelitError("Not connected")
-        _LOGGER.debug(f"Writing {len(data)} bytes: {data.hex(' ')}")
+        _LOGGER.debug("Writing %d bytes: %s", len(data), _format_packet_for_log(data))
         self._writer.write(data)
         try:
             await self._writer.drain()
@@ -487,7 +506,7 @@ class IconaBridgeClient:
                 "send_json on %s (server_channel_id=%d): %s",
                 channel.name,
                 channel.server_channel_id,
-                msg,
+                _redact_json_message(msg),
             )
 
             loop = asyncio.get_running_loop()

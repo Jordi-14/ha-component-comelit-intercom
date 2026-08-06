@@ -679,11 +679,14 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
         if not self._video_session:
             return
         self.request_video_stop()
-        await self.async_stop_video(reason="call audio disabled")
-        # The card reopens a receive-only WebRTC view after the intercom has
-        # had time to release the answered call. Starting here as well raced
-        # the device's RTPC close and produced a signaled session with no RTP.
-        self._video_stopped_by_user = False
+        try:
+            # The acknowledged channel-close barrier includes a full connection
+            # reset fallback. Once this returns, starting the next receive-only
+            # session can no longer race the panel's old RTPC.
+            await self.async_stop_video(reason="call audio disabled")
+        finally:
+            self._video_stopped_by_user = False
+        await self.async_start_video(by_user=True)
 
     @property
     def video_stopped_by_user(self) -> bool:
