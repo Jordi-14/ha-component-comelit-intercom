@@ -404,8 +404,7 @@ class LocalRtspServer:
                         f"CSeq: {cseq}\r\n"
                         f"Content-Type: application/sdp\r\n"
                         f"Content-Length: {len(sdp)}\r\n"
-                        f"\r\n".encode()
-                        + sdp
+                        f"\r\n".encode() + sdp
                     )
                     await writer.drain()
 
@@ -636,8 +635,9 @@ class LocalRtspServer:
                     channel = header[0]
                     length = struct.unpack("!H", header[1:3])[0]
                     rtp = await reader.readexactly(length)
-                    if channel == client.backchannel_ch and self._queue_backchannel_rtp(
-                        rtp
+                    if (
+                        channel == client.backchannel_ch
+                        and self._queue_backchannel_rtp(rtp)
                     ):
                         if not client.backchannel_started:
                             client.backchannel_started = True
