@@ -18,6 +18,18 @@ COMPONENT_DIR = (
     Path(__file__).resolve().parents[1] / "custom_components" / "comelit_intercom"
 )
 
+try:
+    import homeassistant.components  # noqa: F401
+except ImportError:
+    HAS_HOMEASSISTANT = False
+else:
+    HAS_HOMEASSISTANT = True
+
+requires_homeassistant = pytest.mark.skipif(
+    not HAS_HOMEASSISTANT,
+    reason="Home Assistant is required for coordinator and entity tests",
+)
+
 
 def _package(name: str, path: Path) -> None:
     """Load a package namespace without executing the HA integration setup."""
@@ -50,10 +62,9 @@ _package("custom_components", COMPONENT_DIR.parent)
 _package("custom_components.comelit_intercom", COMPONENT_DIR)
 _package("custom_components.comelit_intercom.video", COMPONENT_DIR / "video")
 
-from custom_components.comelit_intercom import coordinator as coordinator_module
-from custom_components.comelit_intercom.camera import (  # noqa: E402
-    ComelitIntercomCamera,
-)
+if HAS_HOMEASSISTANT:
+    from custom_components.comelit_intercom import coordinator as coordinator_module
+    from custom_components.comelit_intercom.camera import ComelitIntercomCamera
 from custom_components.comelit_intercom.video.channels import (  # noqa: E402
     Channel,
     ChannelType,
@@ -86,6 +97,7 @@ from custom_components.comelit_intercom.video.video_call import (  # noqa: E402
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_actuator", [False, True])
+@requires_homeassistant
 async def test_door_buttons_use_proven_dedicated_legacy_sequence(
     is_actuator: bool,
 ) -> None:
@@ -142,6 +154,7 @@ def _camera_coordinator() -> MagicMock:
 
 
 @pytest.mark.asyncio
+@requires_homeassistant
 async def test_camera_uses_a_cached_still_without_reopening_the_panel() -> None:
     """Dashboard image polling reuses a JPEG during the cache interval."""
     coordinator = _camera_coordinator()
@@ -156,6 +169,7 @@ async def test_camera_uses_a_cached_still_without_reopening_the_panel() -> None:
 
 
 @pytest.mark.asyncio
+@requires_homeassistant
 async def test_camera_live_view_starts_without_video_buttons() -> None:
     """Opening the native camera dialog starts a viewer-owned live session."""
     coordinator = _camera_coordinator()
@@ -175,6 +189,7 @@ async def test_camera_live_view_starts_without_video_buttons() -> None:
 
 
 @pytest.mark.asyncio
+@requires_homeassistant
 async def test_camera_releases_live_video_after_viewer_closes() -> None:
     """The panel is released automatically instead of requiring Stop video."""
     coordinator = _camera_coordinator()
@@ -188,6 +203,7 @@ async def test_camera_releases_live_video_after_viewer_closes() -> None:
 
 
 @pytest.mark.asyncio
+@requires_homeassistant
 async def test_live_request_promotes_snapshot_session() -> None:
     """A click during still capture reuses the negotiated panel session."""
     coordinator = coordinator_module.ComelitDataUpdateCoordinator.__new__(
@@ -211,6 +227,7 @@ async def test_live_request_promotes_snapshot_session() -> None:
 
 
 @pytest.mark.asyncio
+@requires_homeassistant
 async def test_short_snapshot_session_is_released_after_one_frame() -> None:
     """A still capture does not leave the intercom media channel occupied."""
     coordinator = coordinator_module.ComelitDataUpdateCoordinator.__new__(
@@ -233,6 +250,7 @@ async def test_short_snapshot_session_is_released_after_one_frame() -> None:
 
 
 @pytest.mark.asyncio
+@requires_homeassistant
 async def test_short_snapshot_session_is_released_without_a_receiver() -> None:
     """An incomplete still session must not leave the intercom occupied."""
     coordinator = coordinator_module.ComelitDataUpdateCoordinator.__new__(
