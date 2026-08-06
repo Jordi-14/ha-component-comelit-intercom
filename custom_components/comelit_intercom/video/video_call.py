@@ -105,6 +105,7 @@ class VideoCallSession:
             tuple[IconaBridgeClient, Channel, str, str, str, int, int] | None
         ) = None
         self._device_rtpc_req_id: int = 0
+        self._device_rtpc_channel: Channel | None = None
         self._cleanup_requires_reconnect: bool = False
         # True when this session opened CTPP itself (notifications OFF).
         # False when reusing the coordinator-opened channel (notifications ON).
@@ -481,6 +482,7 @@ class VideoCallSession:
                     device_rtpc.open_event.wait(), timeout=VIDEO_RESPONSE_TIMEOUT
                 )
                 self._device_rtpc_req_id = device_rtpc.server_channel_id
+                self._device_rtpc_channel = device_rtpc
                 _LOGGER.debug(
                     "Device opened RTPC: 0x%04X", device_rtpc.server_channel_id
                 )
@@ -688,6 +690,39 @@ class VideoCallSession:
         """
         try:
             while self._active:
+                # This device closes its RTPC channel when the media lease
+                # expires.  The accompanying 0x0003/0x000E CTPP message is
+                # ambiguous (other firmware emits it as a periodic config
+                # acknowledgement), so use the actual channel close as the
+                # authoritative renewal signal.
+                device_rtpc_channel = getattr(self, "_device_rtpc_channel", None)
+                if device_rtpc_channel is not None and not device_rtpc_channel.is_open:
+                    _LOGGER.info(
+                        "Device RTPC media lease ended — re-establishing session"
+                    )
+                    try:
+                        async with self._ctpp_lock:
+                            call_counter = await self._inline_reestablish(
+                                client,
+                                ctpp,
+                                our_addr,
+                                entrance_addr,
+                                rtpc1_server_id,
+                                media_req_id,
+                                call_counter,
+                            )
+                            self._call_counter = call_counter
+                        _LOGGER.info("Comelit media lease renewed")
+                    except Exception:
+                        _LOGGER.warning(
+                            "Media lease renewal failed — restarting the full session",
+                            exc_info=True,
+                        )
+                        self._active = False
+                        if self._on_call_end:
+                            self._on_call_end()
+                        return
+                    continue
                 try:
                     async with asyncio.timeout(2.0):
                         resp = await client.read_response(ctpp)
@@ -855,20 +890,23 @@ class VideoCallSession:
             await asyncio.wait_for(
                 device_rtpc.open_event.wait(), timeout=VIDEO_RESPONSE_TIMEOUT
             )
-        if device_rtpc.is_open:
-            self._device_rtpc_req_id = device_rtpc.server_channel_id
-            if getattr(self, "_audio_answered", False) and self._rtp_receiver:
-                self._rtp_receiver.start_audio_sender(self._device_rtpc_req_id)
-            if self._tcp_task and not self._tcp_task.done():
-                self._tcp_task.cancel()
-            if self._rtp_receiver:
-                rtpc2 = client.get_channel("RTPC2")
-                if rtpc2:
-                    self._tcp_task = asyncio.create_task(
-                        self._tcp_inbound_media_router(
-                            client, device_rtpc, rtpc2, self._rtp_receiver
-                        )
+        if not device_rtpc.is_open:
+            client.release_placeholder_channel("RTPC_DEVICE_REEST")
+            raise RuntimeError("Device did not reopen its RTPC media channel")
+        self._device_rtpc_req_id = device_rtpc.server_channel_id
+        self._device_rtpc_channel = device_rtpc
+        if getattr(self, "_audio_answered", False) and self._rtp_receiver:
+            self._rtp_receiver.start_audio_sender(self._device_rtpc_req_id)
+        if self._tcp_task and not self._tcp_task.done():
+            self._tcp_task.cancel()
+        if self._rtp_receiver:
+            rtpc2 = client.get_channel("RTPC2")
+            if rtpc2:
+                self._tcp_task = asyncio.create_task(
+                    self._tcp_inbound_media_router(
+                        client, device_rtpc, rtpc2, self._rtp_receiver
                     )
+                )
         call_counter = await self._ack_device_rtpc_link(
             client, ctpp, our_addr, entrance_addr, call_counter
         )
@@ -1239,6 +1277,7 @@ class VideoCallSession:
                     device_rtpc.open_event.wait(), timeout=VIDEO_RESPONSE_TIMEOUT
                 )
                 self._device_rtpc_req_id = device_rtpc.server_channel_id
+                self._device_rtpc_channel = device_rtpc
                 _LOGGER.debug("Inbound: device RTPC=0x%04X", self._device_rtpc_req_id)
                 # Step 17: Start audio sender immediately — device requires this for video to flow
                 if self._rtp_receiver:

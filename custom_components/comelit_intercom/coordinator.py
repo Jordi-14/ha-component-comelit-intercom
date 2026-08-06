@@ -845,8 +845,9 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
     def _record_unexpected_video_end(self) -> None:
         """Expose a device-ended call to entities, automations, and the UI."""
         self._last_video_end_reason = (
-            "The intercom ended this Home Assistant call. Another client, "
-            "such as the Comelit app, may have taken control of the camera."
+            "The active intercom session ended unexpectedly. The panel may have "
+            "timed out, the network connection may have been interrupted, or "
+            "another client may have taken control."
         )
         self._last_video_end_at = datetime.now(UTC).isoformat()
         self._on_push_event(

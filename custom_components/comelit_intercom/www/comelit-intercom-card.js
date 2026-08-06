@@ -16,7 +16,8 @@ class ComelitIntercomCard extends HTMLElement {
     this._pendingCandidates = [];
     this._connected = false;
     this._micEnabled = false;
-    this._autoStarted = false;
+    this._nativeStream = null;
+    this._mountingNativeStream = false;
     this._failureReason = null;
     this._videoLoaded = false;
   }
@@ -34,14 +35,16 @@ class ComelitIntercomCard extends HTMLElement {
   set hass(hass) {
     this._hass = hass;
     const camera = this._cameraState();
-    const video = this.shadowRoot?.querySelector("video");
+    const video = this.shadowRoot?.getElementById("call-video");
     if (video && camera?.attributes?.access_token) {
       video.poster = `/api/camera_proxy/${this._config.entity}?token=${camera.attributes.access_token}`;
     }
+    if (this._nativeStream) {
+      this._nativeStream.hass = hass;
+    }
     this._refreshIdleState();
-    if (this._config && !this._autoStarted) {
-      this._autoStarted = true;
-      queueMicrotask(() => this._connect(false));
+    if (this._config && !this._pc) {
+      queueMicrotask(() => this._ensureNativeStream());
     }
   }
 
@@ -59,7 +62,9 @@ class ComelitIntercomCard extends HTMLElement {
       <style>
         ha-card { overflow: hidden; }
         .video { position: relative; aspect-ratio: 4 / 3; background: #000; }
-        video { width: 100%; height: 100%; object-fit: contain; }
+        #native-stream, #native-stream > * { width: 100%; height: 100%; display: block; }
+        #call-video { width: 100%; height: 100%; object-fit: contain; }
+        [hidden] { display: none !important; }
         audio { display: none; }
         .status { position: absolute; left: 10px; bottom: 10px; max-width: calc(100% - 36px);
           color: white; background: rgba(0,0,0,.7); border-radius: 6px; padding: 6px 8px;
@@ -76,9 +81,10 @@ class ComelitIntercomCard extends HTMLElement {
       </style>
       <ha-card>
         <div class="video">
-          <video autoplay playsinline muted></video>
+          <div id="native-stream"></div>
+          <video id="call-video" autoplay playsinline muted hidden></video>
           <audio autoplay playsinline muted></audio>
-          <div class="status">Idle</div>
+          <div class="status">Connecting video…</div>
         </div>
         <div class="controls">
           <button id="connect">START CALL</button>
@@ -97,6 +103,66 @@ class ComelitIntercomCard extends HTMLElement {
 
   _cameraState() {
     return this._hass?.states?.[this._config.entity];
+  }
+
+  async _ensureNativeStream() {
+    if (
+      !this.isConnected || !this._hass || !this._config || this._pc ||
+      this._nativeStream || this._mountingNativeStream
+    ) return;
+
+    this._mountingNativeStream = true;
+    try {
+      // Embed HA's official live picture card. It owns WebRTC/HLS fallback,
+      // ICE negotiation, and Companion App routing instead of duplicating
+      // those version-sensitive details here.
+      if (!window.loadCardHelpers) {
+        throw new Error("Home Assistant's card helpers are unavailable");
+      }
+      const helpers = await window.loadCardHelpers();
+      const container = this.shadowRoot?.getElementById("native-stream");
+      if (!container) return;
+      const stream = await helpers.createCardElement({
+        type: "picture-entity",
+        entity: this._config.entity,
+        camera_view: "live",
+        show_name: false,
+        show_state: false,
+        fit_mode: "contain",
+      });
+      stream.hass = this._hass;
+      stream.style.setProperty("--ha-card-border-width", "0");
+      stream.style.setProperty("--ha-card-border-radius", "0");
+      stream.addEventListener("load", () => this._status("Live"));
+      stream.addEventListener("streams", (event) => {
+        if (event.detail?.hasVideo === false) {
+          this._status("Live video unavailable; showing the latest image");
+        } else if (event.detail?.hasVideo) {
+          this._status("Live");
+        }
+      });
+      container.replaceChildren(stream);
+      this._nativeStream = stream;
+      this._status("Connecting video…");
+    } catch (error) {
+      this._status(error.message || "Unable to load Home Assistant's camera player");
+    } finally {
+      this._mountingNativeStream = false;
+    }
+  }
+
+  _removeNativeStream() {
+    this._nativeStream?.remove();
+    this._nativeStream = null;
+    const container = this.shadowRoot?.getElementById("native-stream");
+    if (container) container.replaceChildren();
+  }
+
+  _showCallVideo(show) {
+    const video = this.shadowRoot?.getElementById("call-video");
+    if (video) video.hidden = !show;
+    const native = this.shadowRoot?.getElementById("native-stream");
+    if (native) native.hidden = show;
   }
 
   _isInbound() {
@@ -138,45 +204,46 @@ class ComelitIntercomCard extends HTMLElement {
 
   async _toggleCall() {
     const wasAudioCall = Boolean(this._mic);
-    this._teardown(false);
+    this._teardown(false, false);
     try {
       if (wasAudioCall) {
         this._status("Restoring video…");
         // The service now returns only after the old device channels are
         // released and a fresh receive-only Comelit session is ready.
         await this._setCall(false);
-        await this._connect(false);
+        this._showCallVideo(false);
+        await this._ensureNativeStream();
       } else {
-        await this._connect(true);
+        this._removeNativeStream();
+        this._showCallVideo(true);
+        await this._connect();
       }
     } catch (error) {
       await this._fail(error.message || "Unable to change the intercom call state.");
     }
   }
 
-  async _connect(withAudio) {
+  async _connect() {
     if (this._pc) return;
     this._failureReason = null;
     const connect = this.shadowRoot.getElementById("connect");
     connect.disabled = true;
-    this._status(withAudio ? "Requesting microphone…" : "Connecting video…");
+    this._status("Requesting microphone…");
 
     try {
       const speaker = this.shadowRoot.querySelector("audio");
-      speaker.muted = !withAudio;
-      if (withAudio) speaker.play().catch(() => {});
+      speaker.muted = false;
+      speaker.play().catch(() => {});
 
-      if (withAudio) {
-        if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
-          throw new Error("Microphone access requires an HTTPS Home Assistant URL");
-        }
-        this._mic = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-          video: false,
-        });
-        this._mic.getAudioTracks().forEach((track) => { track.enabled = false; });
-        await this._setCall(true);
+      if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+        throw new Error("Microphone access requires an HTTPS Home Assistant URL");
       }
+      this._mic = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: false,
+      });
+      this._mic.getAudioTracks().forEach((track) => { track.enabled = false; });
+      await this._setCall(true);
 
       // Use the same ICE/server configuration as Home Assistant's native
       // camera player. This is important for both browsers and companion apps,
@@ -189,13 +256,11 @@ class ComelitIntercomCard extends HTMLElement {
       if (clientConfig.dataChannel) {
         this._pc.createDataChannel(clientConfig.dataChannel);
       }
-      if (this._mic) {
-        const track = this._mic.getAudioTracks()[0];
-        this._pc.addTransceiver(track, { direction: "sendrecv", streams: [this._mic] });
-      }
+      const track = this._mic.getAudioTracks()[0];
+      this._pc.addTransceiver(track, { direction: "sendrecv", streams: [this._mic] });
       this._pc.addTransceiver("video", { direction: "recvonly" });
       this._pc.ontrack = (event) => {
-        const video = this.shadowRoot.querySelector("video");
+        const video = this.shadowRoot.getElementById("call-video");
         const audio = this.shadowRoot.querySelector("audio");
         const media = event.track.kind === "video" ? video : audio;
         if (!media.srcObject) media.srcObject = new MediaStream();
@@ -207,14 +272,14 @@ class ComelitIntercomCard extends HTMLElement {
           video.play().catch(() => {
             this._status("Tap the video to start playback");
           });
-        } else if (withAudio) {
+        } else {
           audio.muted = false;
           audio.play().catch(() => {
             this._status("Tap the video to enable exterior audio");
           });
         }
       };
-      const video = this.shadowRoot.querySelector("video");
+      const video = this.shadowRoot.getElementById("call-video");
       video.onloadeddata = () => {
         this._videoLoaded = true;
         this._status("Live");
@@ -231,43 +296,40 @@ class ComelitIntercomCard extends HTMLElement {
           this._connected = true;
           const call = this.shadowRoot.getElementById("connect");
           call.disabled = false;
-          call.textContent = this._mic ? "END CALL" : "ENABLE AUDIO";
-          call.classList.toggle("active", Boolean(this._mic));
+          call.textContent = "END CALL";
+          call.classList.add("active");
           const mic = this.shadowRoot.getElementById("mic");
-          mic.disabled = !this._mic;
-          mic.title = this._mic ? "Mute or unmute your microphone" : "Enable exterior audio first";
-        } else if (["failed", "closed"].includes(this._pc.connectionState)) {
-          await this._fail(
-            "The intercom ended this Home Assistant call. Another client, such as the Comelit app, may have taken control.",
-          );
+          mic.disabled = false;
+          mic.title = "Mute or unmute your microphone";
+        } else if (this._pc.connectionState === "failed") {
+          await this._fail("The two-way audio connection failed; live video has been restored.");
         }
       };
       this._pc.oniceconnectionstatechange = () => {
         if (this._pc?.iceConnectionState === "failed") {
-          this._status("Reconnecting video…");
-          this._pc.restartIce();
+          this._status("The call connection failed; restoring live video…");
         }
       };
       this._pc.onicecandidate = async (event) => {
         if (!event.candidate?.candidate) return;
-        const candidate = {
-          candidate: event.candidate.candidate,
-          sdpMid: event.candidate.sdpMid,
-          sdpMLineIndex: event.candidate.sdpMLineIndex,
-        };
+        // Preserve usernameFragment and every browser-specific candidate
+        // field exactly as HA's native player does.
+        const candidate = event.candidate.toJSON();
         if (!this._sessionId) this._pendingCandidates.push(candidate);
         else await this._sendCandidate(candidate);
       };
 
-      const offer = await this._pc.createOffer();
+      const offer = await this._pc.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: true,
+      });
       await this._pc.setLocalDescription(offer);
-      await new Promise((resolve) => setTimeout(resolve, 150));
       this._unsubscribe = await this._hass.connection.subscribeMessage(
         (message) => this._onSignal(message),
         {
           type: "camera/webrtc/offer",
           entity_id: this._config.entity,
-          offer: this._pc.localDescription.sdp,
+          offer: offer.sdp,
         },
       );
     } catch (error) {
@@ -307,7 +369,7 @@ class ComelitIntercomCard extends HTMLElement {
   async _fail(reason) {
     const hadAudio = Boolean(this._mic);
     this._failureReason = reason;
-    this._teardown(false);
+    this._teardown(false, false);
     this._status(reason);
     if (hadAudio) {
       try {
@@ -317,6 +379,8 @@ class ComelitIntercomCard extends HTMLElement {
       }
       this._status(reason);
     }
+    this._showCallVideo(false);
+    await this._ensureNativeStream();
   }
 
   _setMic(enabled) {
@@ -328,11 +392,11 @@ class ComelitIntercomCard extends HTMLElement {
     mic.classList.toggle("active", enabled);
   }
 
-  _teardown(setIdle = true) {
+  _teardown(setIdle = true, restoreNative = true) {
     this._connected = false;
     this._micEnabled = false;
     this._videoLoaded = false;
-    const video = this.shadowRoot?.querySelector("video");
+    const video = this.shadowRoot?.getElementById("call-video");
     if (video?.srcObject) {
       video.srcObject.getTracks().forEach((track) => track.stop());
       video.srcObject = null;
@@ -367,12 +431,15 @@ class ComelitIntercomCard extends HTMLElement {
     }
     if (setIdle) {
       this._failureReason = null;
-      this._status("Idle");
+      this._status("Connecting video…");
     }
+    this._showCallVideo(false);
+    if (restoreNative) queueMicrotask(() => this._ensureNativeStream());
   }
 
   disconnectedCallback() {
-    this._teardown();
+    this._removeNativeStream();
+    this._teardown(false, false);
   }
 }
 

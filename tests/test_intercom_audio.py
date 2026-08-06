@@ -179,22 +179,25 @@ def test_card_uses_separate_autoplay_safe_media_elements() -> None:
         encoding="utf-8"
     )
 
-    assert "<video autoplay playsinline muted>" in card
+    assert '<video id="call-video" autoplay playsinline muted hidden>' in card
     assert "<audio autoplay playsinline muted>" in card
     assert 'event.track.kind === "video" ? video : audio' in card
     assert "video.play().catch" in card
 
 
-def test_card_uses_home_assistant_webrtc_client_configuration() -> None:
-    """Browser and app clients must use HA's advertised ICE configuration."""
+def test_card_uses_native_ha_player_and_webrtc_configuration() -> None:
+    """Normal video uses HA's player; calls use HA's advertised ICE setup."""
     card = (COMPONENT_DIR / "www" / "comelit-intercom-card.js").read_text(
         encoding="utf-8"
     )
 
+    assert 'type: "picture-entity"' in card
+    assert 'camera_view: "live"' in card
+    assert "window.loadCardHelpers" in card
     assert 'type: "camera/webrtc/get_client_config"' in card
     assert "new RTCPeerConnection(clientConfig.configuration)" in card
+    assert "event.candidate.toJSON()" in card
     assert 'sdpMid: "0"' in card
-    assert "this._pc.restartIce()" in card
 
 
 def test_card_cache_version_matches_integration_version() -> None:
@@ -367,6 +370,34 @@ async def test_zero_sub_status_renews_expired_session() -> None:
 
     session._inline_reestablish.assert_awaited_once()
     assert session._call_counter == 42
+
+
+@pytest.mark.asyncio
+async def test_closed_device_rtpc_channel_renews_media_lease() -> None:
+    """The panel's actual RTPC close renews even when CTPP status is ambiguous."""
+    session = VideoCallSession.__new__(VideoCallSession)
+    session._active = True
+    session._ctpp_lock = asyncio.Lock()
+    session._call_counter = 0
+    session._device_rtpc_channel = Channel(
+        name="RTPC_DEVICE",
+        channel_type=ChannelType.UAUT,
+        request_id=0,
+        server_channel_id=0x1234,
+        is_open=False,
+    )
+    client = MagicMock()
+
+    async def renew(*_args: object) -> int:
+        session._active = False
+        return 43
+
+    session._inline_reestablish = AsyncMock(side_effect=renew)
+
+    await session._ctpp_monitor_loop(client, MagicMock(), "A1", "B1", 1, 2, 3)
+
+    session._inline_reestablish.assert_awaited_once()
+    assert session._call_counter == 43
 
 
 @pytest.mark.asyncio

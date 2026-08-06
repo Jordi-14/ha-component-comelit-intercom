@@ -91,16 +91,28 @@ class ComelitIntercomCamera(Camera):
         }
 
     async def stream_source(self) -> str | None:
-        """Return the local RTSP URL once video media is ready."""
-        if self.is_streaming:
-            return self._coordinator.rtsp_url
-        try:
-            await asyncio.wait_for(
-                self._coordinator.video_ready_event.wait(), timeout=8.0
-            )
-        except TimeoutError:
-            return None
-        return self._coordinator.rtsp_url
+        """Start the panel stream on demand and return its local RTSP relay."""
+        if not self.is_streaming:
+            try:
+                # The frontend owns the viewing lifetime. The panel's shorter
+                # media lease is renewed independently by VideoCallSession.
+                await self._coordinator.async_start_video(
+                    auto_timeout=False, by_user=True
+                )
+            except Exception:
+                _LOGGER.warning(
+                    "Unable to start the Comelit video stream", exc_info=True
+                )
+                return None
+
+        source = self._coordinator.rtsp_url
+        session = self._coordinator.video_session
+        with_audio = bool(session and session.audio_answered)
+        if rtsp_server := self._coordinator.rtsp_server:
+            rtsp_server.set_audio_enabled(with_audio)
+        if source and with_audio:
+            return f"{source}#backchannel=1"
+        return source
 
     async def async_camera_image(
         self,
@@ -123,21 +135,8 @@ class ComelitIntercomCamera(Camera):
         session_id: str,
         send_message: WebRTCSendMessage,
     ) -> None:
-        """Forward a WebRTC offer to go2rtc's two-way-audio stream."""
-        if not self.is_streaming:
-            try:
-                await self._coordinator.async_start_video(by_user=True)
-            except Exception as err:
-                send_message(WebRTCError(code="video_start_failed", message=str(err)))
-                return
-
+        """Start media on demand and delegate WebRTC to HA's provider."""
         source = await self.stream_source()
-        session = self._coordinator.video_session
-        with_audio = bool(session and session.audio_answered)
-        if rtsp_server := self._coordinator.rtsp_server:
-            rtsp_server.set_audio_enabled(with_audio)
-        if source and with_audio:
-            source = f"{source}#backchannel=1"
         for provider in self.hass.data.get(DATA_WEBRTC_PROVIDERS, set()):
             if source and provider.async_is_supported(source):
                 self._webrtc_sessions[session_id] = provider
