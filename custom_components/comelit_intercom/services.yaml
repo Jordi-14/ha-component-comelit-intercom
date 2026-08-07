@@ -1,0 +1,12 @@
+stop_video:
+  name: Stop dashboard video
+  description: Stop a video or still session owned by a Comelit dashboard card.
+  fields:
+    entity_id:
+      name: Camera
+      description: Comelit camera entity whose card-owned session should stop.
+      required: true
+      selector:
+        entity:
+          domain: camera
+          integration: comelit_intercom

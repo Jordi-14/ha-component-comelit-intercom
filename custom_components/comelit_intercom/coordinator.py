@@ -534,6 +534,16 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
             # user-visible latency stays at ~3 s.
             try:
                 await session.start()
+                # A visible dashboard can disappear while ICONA negotiation is
+                # still in flight. The session is not published until media is
+                # ready, so the normal stop path cannot see it during that
+                # window. Honour the stop request before exposing the stream.
+                if self._video_stopped_by_user:
+                    await session.stop(reason="cancelled while starting")
+                    if self._rtsp_server:
+                        self._rtsp_server.mark_not_ready()
+                        self._rtsp_server.disconnect_clients()
+                    raise RuntimeError("Video start was cancelled")
                 _LOGGER.info("Video session ready in %.1fs", time.monotonic() - t0)
                 if self._rtsp_server and session.rtp_receiver:
                     session.rtp_receiver.attach_backchannel_queue(

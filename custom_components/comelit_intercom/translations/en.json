@@ -36,5 +36,17 @@
     "door_open_failed": {
       "message": "The {door} control could not be activated."
     }
+  },
+  "entity": {
+    "switch": {
+      "automatic_still_previews": {
+        "name": "Automatic still previews"
+      }
+    },
+    "number": {
+      "still_preview_interval": {
+        "name": "Still preview interval"
+      }
+    }
   }
 }
