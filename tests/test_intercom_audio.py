@@ -249,6 +249,45 @@ async def test_live_request_promotes_snapshot_session() -> None:
 
 @pytest.mark.asyncio
 @requires_homeassistant
+async def test_video_start_honors_stop_requested_during_negotiation() -> None:
+    """A hidden dashboard must not publish a session that just became ready."""
+    coordinator = coordinator_module.ComelitDataUpdateCoordinator.__new__(
+        coordinator_module.ComelitDataUpdateCoordinator
+    )
+    coordinator._config = MagicMock()
+    coordinator._client = MagicMock(connected=True)
+    coordinator._video_start_lock = asyncio.Lock()
+    coordinator._video_session = None
+    coordinator._video_session_purpose = None
+    coordinator._video_stopped_by_user = False
+    coordinator._vip_listener = None
+    coordinator._rtsp_server = MagicMock()
+    coordinator.async_stop_video = AsyncMock()
+    coordinator._ensure_vip_listener = AsyncMock()
+
+    session = MagicMock(cleanup_requires_reconnect=False)
+
+    async def _finish_after_stop_request() -> None:
+        coordinator.request_video_stop()
+
+    session.start = AsyncMock(side_effect=_finish_after_stop_request)
+    session.stop = AsyncMock()
+
+    with (
+        patch.object(coordinator_module, "VideoCallSession", return_value=session),
+        pytest.raises(RuntimeError, match="cancelled"),
+    ):
+        await coordinator.async_start_video(by_user=True)
+
+    session.stop.assert_awaited_once_with(reason="cancelled while starting")
+    coordinator._rtsp_server.mark_not_ready.assert_called_once()
+    coordinator._rtsp_server.disconnect_clients.assert_called_once()
+    coordinator._ensure_vip_listener.assert_awaited_once()
+    assert coordinator._video_session is None
+
+
+@pytest.mark.asyncio
+@requires_homeassistant
 async def test_short_snapshot_session_is_released_after_one_frame() -> None:
     """A still capture does not leave the intercom media channel occupied."""
     coordinator = coordinator_module.ComelitDataUpdateCoordinator.__new__(
@@ -291,20 +330,20 @@ async def test_short_snapshot_session_is_released_without_a_receiver() -> None:
     coordinator._ensure_vip_listener.assert_awaited_once()
 
 
-def test_integration_exposes_native_camera_and_original_door_buttons() -> None:
-    """This beta keeps doors but drops calls, events, and the custom card."""
+def test_integration_exposes_camera_doors_and_preview_controls() -> None:
+    """The stable camera keeps doors and adds privacy preview settings."""
     setup_source = (COMPONENT_DIR / "__init__.py").read_text(encoding="utf-8")
-    assert "PLATFORMS: list[Platform] = [Platform.BUTTON, Platform.CAMERA]" in (
-        setup_source
-    )
+    for platform in ("BUTTON", "CAMERA", "NUMBER", "SWITCH"):
+        assert f"Platform.{platform}" in setup_source
     assert "_remove_obsolete_intercom_entities" in setup_source
     button_source = (COMPONENT_DIR / "button.py").read_text(encoding="utf-8")
     assert "ComelitDoorButton" in button_source
     assert "ComelitStartVideoButton" not in button_source
     assert "ComelitStopVideoButton" not in button_source
     assert not (COMPONENT_DIR / "event.py").exists()
-    assert not (COMPONENT_DIR / "switch.py").exists()
-    assert not (COMPONENT_DIR / "www" / "comelit-intercom-card.js").exists()
+    assert (COMPONENT_DIR / "number.py").exists()
+    assert (COMPONENT_DIR / "switch.py").exists()
+    assert (COMPONENT_DIR / "www" / "comelit-intercom-card.js").exists()
 
 
 @pytest.mark.asyncio

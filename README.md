@@ -17,9 +17,10 @@ Docker containers.
 - **Automatic token extraction** - no manual token retrieval required (if using default password)
 - Automatic discovery of all available doors and compatible relay/actuator controls
 - Creates button entities for each door and compatible relay/actuator control
-- **Security-camera-style video in Home Assistant** with cached dashboard
-  stills and live video on demand
-- No custom dashboard card or manual Start/Stop video controls
+- **Privacy-aware camera previews** with an opt-in schedule, timestamped stills,
+  and live video on demand
+- A configurable `0–180` minute preview interval in half-minute steps; `0`
+  keeps the card live only while it is visible
 - No audio or call controls in this camera-focused beta
 - Simple configuration through Home Assistant UI
 - Works with Comelit intercom models that support the ICONA Bridge protocol
@@ -82,43 +83,46 @@ After configuration, the integration will:
 2. Authenticate using your token
 3. Discover all available doors and compatible relay/actuator controls
 4. Create a button entity for each discovered control (e.g., `button.comelit_front_door_unlatch`)
-5. Create one standard `Live feed` camera entity
+5. Create one `Live feed` camera entity and two dashboard-preview settings
 
 You can then:
 - Add door buttons to your dashboard
-- Add the `Live feed` entity beside other security cameras
-- See periodically refreshed stills without keeping a panel call open
-- Click the camera for on-demand live video
+- Add the privacy-aware Comelit card beside other security cameras
+- Opt into periodically refreshed stills without keeping a panel call open
+- Click the card for on-demand live video
 - Use with voice assistants ("Hey Google, press the front door button")
 - Include in scripts and scenes
 - Trigger from presence detection, NFC tags, etc.
 
-### Standard security camera card
+### Privacy-aware camera card
 
-The camera works with Home Assistant's built-in picture entity card. In the
-dashboard overview, `camera_view: auto` displays cached JPEG stills and does not
-send a continuous stream over the browser's internet connection. Clicking the
-image opens Home Assistant's normal camera dialog and starts live video on
-demand.
+The integration registers `custom:comelit-intercom-card` automatically. Add it
+to a dashboard with the camera and the two setting entities created for your
+intercom (entity IDs can differ if the device was renamed):
 
 ```yaml
-type: picture-entity
-entity: camera.comelit_intercom_live_feed
-camera_view: auto
-show_name: true
-show_state: false
-fit_mode: cover
-tap_action:
-  action: more-info
+type: custom:comelit-intercom-card
+camera_entity: camera.comelit_intercom_live_feed
+preview_switch: switch.comelit_intercom_automatic_still_previews
+preview_interval: number.comelit_intercom_still_preview_interval
 ```
 
-Because the Comelit panel has no known snapshot endpoint, the integration opens
-a short receive-only ICONA session when a cached still becomes stale, decodes
-one JPEG, and releases the panel again. Stills are cached for 15 seconds. If the
-image is clicked while a still is being captured, the same session is promoted
-to live viewing instead of being restarted. WebRTC live sessions are released
-when the viewer closes; compatible HLS fallback sessions have a three-minute
-safety limit.
+`Automatic still previews` is off by default. When enabled, a positive interval
+briefly opens a receive-only ICONA session, captures one JPEG, releases the
+panel, and displays the local capture time in the top-left corner. The allowed
+range is `0–180` minutes in `0.5` minute steps, with a default of 30 minutes.
+Setting the interval to `0` shows constant video while the card is visible.
+
+The scheduling happens in the visible browser card. Leaving the dashboard,
+scrolling the card off screen, hiding the tab, or closing the browser cancels
+future captures and removes an embedded live view. No periodic camera session
+runs in Home Assistant when nobody is viewing the card. Clicking the card at
+any interval opens Home Assistant's live camera dialog.
+
+Because the Comelit panel has no known snapshot endpoint, each still uses a
+short receive-only call and is cached in that browser tab. WebRTC live sessions
+are released when the viewer closes; compatible HLS fallback sessions have a
+three-minute safety limit.
 
 Start video and Stop video entities are no longer created or required.
 
