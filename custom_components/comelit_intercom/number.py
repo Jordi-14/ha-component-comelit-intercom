@@ -25,7 +25,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the still-preview interval number."""
-    coordinator: ComelitDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator: ComelitDataUpdateCoordinator = entry.runtime_data
     async_add_entities([ComelitStillPreviewInterval(coordinator)])
 
 

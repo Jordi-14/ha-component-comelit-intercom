@@ -1,11 +1,12 @@
 """Constants for the Comelit integration."""
 
 DOMAIN = "comelit_intercom"
-INTEGRATION_VERSION = "1.3.0"
+INTEGRATION_VERSION = "1.4.0"
 
 # Configuration keys
 CONF_HOST = "host"
 CONF_TOKEN = "token"
+CONF_DEVICE_ID = "device_id"
 CONF_ENABLE_NOTIFICATIONS = "enable_notifications"
 
 # Default values

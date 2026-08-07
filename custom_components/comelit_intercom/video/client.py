@@ -132,13 +132,13 @@ class IconaBridgeClient:
         self._reader = None
         self._channels.clear()
         # Cancel any pending response futures
-        for future in self._callbacks.values():
-            if not future.done():
-                future.cancel()
+        for response_future in self._callbacks.values():
+            if not response_future.done():
+                response_future.cancel()
         self._callbacks.clear()
-        for future in self._close_waiters.values():
-            if not future.done():
-                future.cancel()
+        for close_future in self._close_waiters.values():
+            if not close_future.done():
+                close_future.cancel()
         self._close_waiters.clear()
         _LOGGER.debug("Disconnected from %s:%s", self.host, self.port)
 

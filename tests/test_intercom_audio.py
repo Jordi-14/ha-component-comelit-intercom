@@ -63,8 +63,14 @@ _package("custom_components.comelit_intercom", COMPONENT_DIR)
 _package("custom_components.comelit_intercom.video", COMPONENT_DIR / "video")
 
 if HAS_HOMEASSISTANT:
+    from custom_components.comelit_intercom import camera as camera_module
     from custom_components.comelit_intercom import coordinator as coordinator_module
-    from custom_components.comelit_intercom.camera import ComelitIntercomCamera
+    from custom_components.comelit_intercom.entity_migration import (
+        beta_door_unique_id,
+        door_unique_id,
+    )
+
+    ComelitIntercomCamera = camera_module.ComelitIntercomCamera
 from custom_components.comelit_intercom.video.channels import (  # noqa: E402
     Channel,
     ChannelType,
@@ -171,6 +177,22 @@ async def test_camera_uses_a_cached_still_without_reopening_the_panel() -> None:
 
 @pytest.mark.asyncio
 @requires_homeassistant
+async def test_camera_is_created_without_any_door_controls() -> None:
+    """Video availability is independent of optional door address books."""
+    coordinator = _camera_coordinator()
+    coordinator.device_config = DeviceConfig(apt_address="SB000001", doors=[])
+    entry = MagicMock(runtime_data=coordinator)
+    add_entities = MagicMock()
+
+    await camera_module.async_setup_entry(MagicMock(), entry, add_entities)
+
+    entities = add_entities.call_args.args[0]
+    assert len(entities) == 1
+    assert isinstance(entities[0], ComelitIntercomCamera)
+
+
+@pytest.mark.asyncio
+@requires_homeassistant
 async def test_camera_live_view_starts_without_video_buttons() -> None:
     """Opening the native camera dialog starts a viewer-owned live session."""
     coordinator = _camera_coordinator()
@@ -221,6 +243,51 @@ async def test_camera_releases_live_video_after_viewer_closes() -> None:
     await camera._async_stop_live_after(0)
 
     coordinator.async_release_live_video.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@requires_homeassistant
+async def test_live_release_waits_for_every_webrtc_viewer() -> None:
+    """Closing one card must not stop another card's camera session."""
+    coordinator = coordinator_module.ComelitDataUpdateCoordinator.__new__(
+        coordinator_module.ComelitDataUpdateCoordinator
+    )
+    coordinator._live_viewers = {"viewer-a", "viewer-b"}
+    coordinator._video_start_lock = asyncio.Lock()
+    coordinator._video_session_purpose = coordinator_module.VIDEO_PURPOSE_LIVE
+    coordinator.request_video_stop = MagicMock()
+    coordinator.async_stop_video = AsyncMock()
+    coordinator._ensure_vip_listener = AsyncMock()
+
+    coordinator.remove_live_viewer("viewer-a")
+    await coordinator.async_release_live_video()
+    coordinator.async_stop_video.assert_not_awaited()
+
+    coordinator.remove_live_viewer("viewer-b")
+    await coordinator.async_release_live_video()
+    coordinator.async_stop_video.assert_awaited_once_with(reason="live viewer closed")
+
+
+def test_doorbell_events_do_not_answer_or_start_video() -> None:
+    """The VIP listener may report a ring but must remain camera-only."""
+    coordinator_source = (COMPONENT_DIR / "coordinator.py").read_text(encoding="utf-8")
+    assert "on_inbound_ring=" not in coordinator_source
+    assert "async_start_inbound_video" not in coordinator_source
+
+
+@requires_homeassistant
+def test_door_unique_id_preserves_pre_camera_identity() -> None:
+    """Normal doors retain opendoor and omit an absent module suffix."""
+    door = Door(
+        id=0,
+        index=0,
+        name="Entrance",
+        apt_address="SB100001",
+        output_index=1,
+    )
+
+    assert door_unique_id("entry", door) == "entry_opendoor_SB100001_1"
+    assert beta_door_unique_id("entry", door) == "entry_door_SB100001_1_0"
 
 
 @pytest.mark.asyncio

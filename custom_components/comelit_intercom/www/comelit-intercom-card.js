@@ -18,6 +18,7 @@ class ComelitIntercomCard extends HTMLElement {
     this._objectUrl = null;
     this._liveCard = null;
     this._liveCardPromise = null;
+    this._policyGeneration = 0;
     this._observer = null;
     this._visibilityHandler = null;
     this.attachShadow({ mode: "open" });
@@ -28,6 +29,7 @@ class ComelitIntercomCard extends HTMLElement {
     if (!cameraEntity || !cameraEntity.startsWith("camera.")) {
       throw new Error("camera_entity must be a Home Assistant camera entity");
     }
+    if (this._config) this._pause();
     this._config = {
       ...config,
       camera_entity: cameraEntity,
@@ -260,7 +262,9 @@ class ComelitIntercomCard extends HTMLElement {
       return;
     }
 
-    this._captureController = new AbortController();
+    const generation = this._policyGeneration;
+    const controller = new AbortController();
+    this._captureController = controller;
     this._setBadge("Taking still…");
     try {
       const entity = encodeURIComponent(this._config.camera_entity);
@@ -268,11 +272,18 @@ class ComelitIntercomCard extends HTMLElement {
       const response = await fetch(url, {
         cache: "no-store",
         credentials: "same-origin",
-        signal: this._captureController.signal,
+        signal: controller.signal,
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const blob = await response.blob();
-      if (!this._isVisible()) return;
+      const current = this._settings();
+      if (
+        generation !== this._policyGeneration ||
+        !this._isVisible() ||
+        !current.enabled ||
+        current.interval === null ||
+        current.interval <= 0
+      ) return;
 
       this._revokeObjectUrl();
       this._objectUrl = URL.createObjectURL(blob);
@@ -287,9 +298,16 @@ class ComelitIntercomCard extends HTMLElement {
         this._setBadge("Preview failed");
       }
     } finally {
-      this._captureController = null;
+      if (this._captureController === controller) {
+        this._captureController = null;
+      }
       const current = this._settings();
-      if (this._isVisible() && current.enabled && current.interval > 0) {
+      if (
+        generation === this._policyGeneration &&
+        this._isVisible() &&
+        current.enabled &&
+        current.interval > 0
+      ) {
         this._scheduleCapture(current.interval * 60_000);
       }
     }
@@ -297,10 +315,18 @@ class ComelitIntercomCard extends HTMLElement {
 
   async _showLive() {
     if (this._liveCard || this._liveCardPromise) return;
+    const generation = this._policyGeneration;
     this._showStill();
     this._setBadge("Starting live…");
-    this._liveCardPromise = (async () => {
+    const liveCardPromise = (async () => {
       const helpers = await window.loadCardHelpers();
+      const settings = this._settings();
+      if (
+        generation !== this._policyGeneration ||
+        !this._isVisible() ||
+        !settings.enabled ||
+        settings.interval !== 0
+      ) return;
       const card = await helpers.createCardElement({
         type: "picture-entity",
         entity: this._config.camera_entity,
@@ -310,7 +336,13 @@ class ComelitIntercomCard extends HTMLElement {
         tap_action: { action: "none" },
         hold_action: { action: "none" },
       });
-      if (!this._isVisible() || this._settings().interval !== 0) return;
+      const current = this._settings();
+      if (
+        generation !== this._policyGeneration ||
+        !this._isVisible() ||
+        !current.enabled ||
+        current.interval !== 0
+      ) return;
       card.hass = this._hass;
       this._liveCard = card;
       const slot = this.shadowRoot.getElementById("live-slot");
@@ -319,13 +351,16 @@ class ComelitIntercomCard extends HTMLElement {
       this.shadowRoot.getElementById("still").style.display = "none";
       this._setBadge("Live", true);
     })();
+    this._liveCardPromise = liveCardPromise;
     try {
-      await this._liveCardPromise;
+      await liveCardPromise;
     } catch (error) {
       console.warn("Comelit live preview failed", error);
       this._setBadge("Live preview failed");
     } finally {
-      this._liveCardPromise = null;
+      if (this._liveCardPromise === liveCardPromise) {
+        this._liveCardPromise = null;
+      }
     }
   }
 
@@ -337,28 +372,18 @@ class ComelitIntercomCard extends HTMLElement {
   }
 
   _removeLiveCard() {
-    const ownedLive = Boolean(this._liveCard || this._liveCardPromise);
+    this._policyGeneration += 1;
     this._liveCard?.remove();
     this._liveCard = null;
     const slot = this.shadowRoot.getElementById("live-slot");
     if (slot) slot.replaceChildren();
-    if (ownedLive) this._stopOwnedSession();
   }
 
   _pause() {
     this._clearTimer();
-    const ownedCapture = Boolean(this._captureController);
     this._abortCapture();
     this._removeLiveCard();
-    if (ownedCapture) this._stopOwnedSession();
     this._showStill();
-  }
-
-  _stopOwnedSession() {
-    if (!this._hass || !this._config) return;
-    this._hass.callService("comelit_intercom", "stop_video", {
-      entity_id: this._config.camera_entity,
-    });
   }
 
   _clearTimer() {

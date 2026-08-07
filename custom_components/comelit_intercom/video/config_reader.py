@@ -8,6 +8,7 @@ from typing import Any
 from ..control_discovery import CONTROL_TYPE_ACTUATOR, extract_controls_from_vip
 from .channels import ChannelType, ViperMessageId
 from .client import IconaBridgeClient
+from .config import device_config_from_vip
 from .exceptions import ProtocolError
 from .models import Camera, DeviceConfig, Door
 
@@ -46,21 +47,15 @@ async def get_device_config(client: IconaBridgeClient) -> DeviceConfig:
 
 def _parse_config(data: dict[str, Any]) -> DeviceConfig:
     """Parse the raw config JSON into a DeviceConfig."""
-    config = DeviceConfig(raw=data)
-
     vip = data.get("vip", {})
-    config.apt_address = vip.get("apt-address", "")
-    config.apt_subaddress = vip.get("apt-subaddress", 0)
+    if not isinstance(vip, dict):
+        vip = {}
+    config = device_config_from_vip(vip)
+    config.raw = data
 
     user_params = vip.get("user-parameters", {})
-
-    # Parse caller address from entrance-address-book (indoor/app unit address)
-    entrance_book = _entries(user_params.get("entrance-address-book", []))
-    if entrance_book:
-        config.caller_address = entrance_book[0].get("apt-address", "")
-        _LOGGER.debug(
-            "Caller address from entrance-address-book: %s", config.caller_address
-        )
+    if not isinstance(user_params, dict):
+        user_params = {}
 
     # Use the fork's hardened discovery so additional/singleton actuators
     # retain the exact behavior already validated on the 6741W.
@@ -74,7 +69,7 @@ def _parse_config(data: dict[str, Any]) -> DeviceConfig:
                 output_index=item.get("output-index", 0),
                 secure_mode=item.get("secure-mode", False),
                 is_actuator=item.get("control-type") == CONTROL_TYPE_ACTUATOR,
-                module_index=item.get("module-index", 0),
+                module_index=item.get("module-index"),
             )
         )
 

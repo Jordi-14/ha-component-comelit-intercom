@@ -21,6 +21,7 @@ Docker containers.
   and live video on demand
 - A configurable `0–180` minute preview interval in half-minute steps; `0`
   keeps the card live only while it is visible
+- Doorbell rings never answer, start, stop, or otherwise take over the camera
 - No audio or call controls in this camera-focused beta
 - Simple configuration through Home Assistant UI
 - Works with Comelit intercom models that support the ICONA Bridge protocol
@@ -56,8 +57,12 @@ After you've installed the component on your system, it's time to set it up:
 
 1. Go to Settings → Devices & Services
 2. Click "Add Integration" and search for "Comelit Intercom"
-3. Enter your device's IP address
+3. Enter your device's IP address and ICONA Bridge port (normally `64100`)
 4. Leave the token field empty for automatic extraction, or provide your token if you know it
+
+Use **Reconfigure** from the integration menu if DHCP changes the device's IP
+address. Home Assistant identifies new installations by the device's VIP
+address, so changing the network address does not create a second device.
 
 ### Automatic Token Extraction
 
@@ -117,7 +122,8 @@ The scheduling happens in the visible browser card. Leaving the dashboard,
 scrolling the card off screen, hiding the tab, or closing the browser cancels
 future captures and removes an embedded live view. No periodic camera session
 runs in Home Assistant when nobody is viewing the card. Clicking the card at
-any interval opens Home Assistant's live camera dialog.
+any interval opens Home Assistant's live camera dialog. Multiple WebRTC viewers
+are tracked independently, so closing one card does not stop another viewer.
 
 Because the Comelit panel has no known snapshot endpoint, each still uses a
 short receive-only call and is cached in that browser tab. WebRTC live sessions

@@ -47,6 +47,9 @@ Do not mix files from different releases.
   remaining on the cached poster.
 - Closing a WebRTC viewer releases the panel automatically; HLS fallback is
   released by its safety timeout.
+- Open the camera in two browsers, close one, and verify the other keeps playing.
+- Ring the doorbell while the camera is idle and while it is playing; the ring
+  must not start, stop, restart, or answer the video session.
 - Test both a browser and the Home Assistant Companion app.
 - Verify every configured door still opens from its existing button entity.
 - Opening the Comelit app during an HA live view releases or interrupts the HA

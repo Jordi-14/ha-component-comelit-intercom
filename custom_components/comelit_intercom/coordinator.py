@@ -22,12 +22,16 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .comelit_client import IconaBridgeClient as LegacyDoorClient
 from .const import CONF_ENABLE_NOTIFICATIONS, DEFAULT_PORT, DOMAIN
-from .control_discovery import CONTROL_TYPE_ACTUATOR, control_identity
+from .control_discovery import (
+    CONTROL_TYPE_ACTUATOR,
+    CONTROL_TYPE_OPENDOOR,
+    control_identity,
+)
 from .video.auth import authenticate
 from .video.channels import ChannelType
 from .video.client import IconaBridgeClient
 from .video.config_reader import get_device_config
-from .video.ctpp import _CTR_INCR_BOTH, ctpp_init_sequence
+from .video.ctpp import ctpp_init_sequence
 from .video.exceptions import AuthenticationError
 from .video.models import DeviceConfig, Door, PushEvent
 from .video.push import register_push, send_push_keepalive
@@ -40,7 +44,6 @@ _LOGGER = logging.getLogger(__name__)
 UPDATE_INTERVAL = timedelta(seconds=30)
 VIDEO_PURPOSE_LIVE = "live"
 VIDEO_PURPOSE_SNAPSHOT = "snapshot"
-VIDEO_PURPOSE_INBOUND = "inbound"
 
 
 class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
@@ -105,6 +108,9 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
         self._on_video_state_change: dict[Callable[[], Awaitable[None]], None] = {}
         self._last_video_end_reason: str | None = None
         self._last_video_end_at: str | None = None
+        # WebRTC viewers own a live session independently. A dashboard card
+        # closing must never tear down media still used by another viewer.
+        self._live_viewers: set[str] = set()
 
     @property
     def device_config(self) -> DeviceConfig | None:
@@ -124,7 +130,11 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
     @property
     def video_available(self) -> bool:
         """Return whether the local relay and Comelit connection are ready."""
-        return self._rtsp_server is not None and self._client is not None
+        return bool(
+            self._rtsp_server is not None
+            and self._client is not None
+            and self._client.connected
+        )
 
     @property
     def video_ready_event(self) -> asyncio.Event:
@@ -140,11 +150,6 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
     def last_video_end_at(self) -> str | None:
         """Return when the most recent unexpected termination occurred."""
         return self._last_video_end_at
-
-    @property
-    def inbound_call_active(self) -> bool:
-        """Return whether an inbound door call is active."""
-        return bool(self._video_session and self._video_session.is_inbound)
 
     async def _open_ctpp_channels(
         self, client: IconaBridgeClient, config: DeviceConfig
@@ -203,7 +208,6 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
                     self._config,
                     self._on_push_event,
                     init_ts=init_ts,
-                    on_inbound_ring=self._on_inbound_ring,
                 )
                 await vip.start()
                 self._vip_listener = vip
@@ -281,7 +285,6 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
                     self._config,
                     self._on_push_event,
                     init_ts=init_ts,
-                    on_inbound_ring=self._on_inbound_ring,
                 )
                 await vip.start()
                 self._vip_listener = vip
@@ -380,12 +383,15 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
 
         control: dict[str, object] = {
             "name": door.name,
-            "control-type": CONTROL_TYPE_ACTUATOR if door.is_actuator else "door",
+            "control-type": (
+                CONTROL_TYPE_ACTUATOR if door.is_actuator else CONTROL_TYPE_OPENDOOR
+            ),
             "apt-address": door.apt_address,
             "output-index": door.output_index,
-            "module-index": door.module_index,
             "secure-mode": door.secure_mode,
         }
+        if door.module_index is not None:
+            control["module-index"] = door.module_index
         door_client = LegacyDoorClient(self.host, self.port)
         try:
             await door_client.connect()
@@ -429,12 +435,15 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
             for door in self._config.doors:
                 door_control: dict[str, object] = {
                     "control-type": (
-                        CONTROL_TYPE_ACTUATOR if door.is_actuator else "door"
+                        CONTROL_TYPE_ACTUATOR
+                        if door.is_actuator
+                        else CONTROL_TYPE_OPENDOOR
                     ),
                     "apt-address": door.apt_address,
                     "output-index": door.output_index,
-                    "module-index": door.module_index,
                 }
+                if door.module_index is not None:
+                    door_control["module-index"] = door.module_index
                 if control_identity(door_control) == identity:
                     await self.async_open_door(door)
                     return
@@ -586,7 +595,10 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
 
     def _on_video_call_end(self) -> None:
         """Called by VideoCallSession when the device sends CALL_END."""
-        if self._video_stopped_by_user:
+        if (
+            self._video_stopped_by_user
+            or self._video_session_purpose != VIDEO_PURPOSE_LIVE
+        ):
             return
         self._record_unexpected_video_end()
         _LOGGER.debug("CALL_END received — scheduling session restart")
@@ -603,134 +615,19 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
         unhandled task exception for a normal, expected situation.
         """
         try:
-            await self.async_start_video(purpose=VIDEO_PURPOSE_LIVE)
+            await self.async_start_video(
+                auto_timeout=False,
+                purpose=VIDEO_PURPOSE_LIVE,
+            )
         except RuntimeError as err:
             _LOGGER.debug("Auto-restart skipped: %s", err)
         except Exception:
             _LOGGER.warning("Auto-restart failed", exc_info=True)
 
-    def _on_inbound_ring(self, entrance_addr: str, ring_ts: int) -> None:
-        """Called by VIP listener when device initiates a ring (PREFIX_CALL_INIT).
-
-        Schedules async_start_inbound_video as a background task so the
-        full 20-step answer sequence runs without blocking the VIP listener loop.
-        """
-        _LOGGER.debug(
-            "Inbound ring: entrance=%s ring_ts=0x%08X", entrance_addr, ring_ts
-        )
-        self.config_entry.async_create_background_task(  # type: ignore[union-attr]
-            self.hass,
-            self.async_start_inbound_video(entrance_addr, ring_ts),
-            "comelit-inbound-video",
-        )
-
-    async def async_start_inbound_video(self, entrance_addr: str, ring_ts: int) -> None:
-        """Answer a device-initiated ring: run inbound signaling and start video.
-
-        On success, fires doorbell_ring after video is ready so automations
-        see the camera stream already flowing when the event triggers.
-        On failure, fires missed_call and restores the VIP listener.
-        """
-        if not self._config:
-            return
-
-        async with self._video_start_lock:
-            if not self._client:
-                return
-            self._video_stopped_by_user = False
-            await self.async_stop_video()
-
-            if self._vip_listener:
-                with contextlib.suppress(Exception):
-                    await self._vip_listener.stop_task()
-                self._vip_listener = None
-
-            session = VideoCallSession(
-                self._client,
-                self._config,
-                auto_timeout=True,
-                rtsp_server=self._rtsp_server,
-                on_call_end=self._on_video_call_end,
-                on_timeout=self._on_video_call_end,
-            )
-            try:
-                renewal_ack_ts = (self._ctpp_init_ts + _CTR_INCR_BOTH) & 0xFFFFFFFF
-                await session.start_inbound(
-                    entrance_addr, ring_ts, renewal_ack_ts=renewal_ack_ts
-                )
-            except Exception:
-                _LOGGER.warning("Inbound call answer failed", exc_info=True)
-                if session.cleanup_requires_reconnect:
-                    try:
-                        await self._reconnect()
-                    except Exception:
-                        _LOGGER.warning(
-                            "Failed to reset connection after inbound call failure",
-                            exc_info=True,
-                        )
-                self._on_push_event(
-                    PushEvent(
-                        event_type="missed_call",
-                        apt_address=entrance_addr,
-                        timestamp=time.time(),
-                    )
-                )
-                await self._ensure_vip_listener()
-                return
-
-            if self._rtsp_server and session.rtp_receiver:
-                session.rtp_receiver.attach_backchannel_queue(
-                    self._rtsp_server.backchannel_queue
-                )
-            self._video_session = session
-            self._video_session_purpose = VIDEO_PURPOSE_INBOUND
-            self._video_stream_revision += 1
-            self._last_video_end_reason = None
-            self._last_video_end_at = None
-            self._video_ready_event.set()
-            if self._rtsp_server:
-                self._rtsp_server.mark_ready()
-            await self._notify_video_state_change()
-            # Fire ring AFTER video is flowing so automations see the stream
-            self._on_push_event(
-                PushEvent(
-                    event_type="ring",
-                    apt_address=entrance_addr,
-                    timestamp=time.time(),
-                )
-            )
-            _LOGGER.info("Inbound video ready, ring fired (entrance=%s)", entrance_addr)
-
-    async def async_answer_inbound(self) -> None:
-        """Start two-way audio for an active inbound call."""
-        if self._video_session and self._video_session.active:
-            await self._video_session.enable_two_way_audio()
-            await self._notify_video_state_change()
-
-    async def async_enable_two_way_audio(self) -> None:
-        """Enable the audio path for the active call."""
-        if self._video_session and self._video_session.active:
-            await self._video_session.enable_two_way_audio()
-            await self._notify_video_state_change()
-
-    async def async_disable_two_way_audio(self) -> None:
-        """End exterior audio while restoring a video-only session."""
-        if not self._video_session:
-            return
-        self.request_video_stop()
-        try:
-            # The acknowledged channel-close barrier includes a full connection
-            # reset fallback. Once this returns, starting the next receive-only
-            # session can no longer race the panel's old RTPC.
-            await self.async_stop_video(reason="call audio disabled")
-        finally:
-            self._video_stopped_by_user = False
-        await self.async_start_video(by_user=True, purpose=VIDEO_PURPOSE_LIVE)
-
     async def async_capture_video_snapshot(self) -> bytes | None:
         """Capture and cache one frame without leaving the panel occupied.
 
-        If a live or inbound session already exists, its newest frame is used
+        If a live session already exists, its newest frame is used
         and the session is left untouched. Otherwise a short receive-only
         session is opened and released after the JPEG has been decoded. A live
         request arriving during that negotiation promotes the same session and
@@ -750,7 +647,7 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
             async with asyncio.timeout(3.0):
                 return await receiver.get_jpeg_frame()
         except TimeoutError:
-            return receiver.latest_frame
+            return receiver.latest_frame if receiver is not None else None
         finally:
             stopped_snapshot = False
             async with self._video_start_lock:
@@ -766,13 +663,26 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
             if stopped_snapshot:
                 await self._ensure_vip_listener()
 
-    async def async_release_live_video(self) -> None:
+    def add_live_viewer(self, viewer_id: str) -> None:
+        """Register a WebRTC viewer that currently owns the live session."""
+        self._live_viewers.add(viewer_id)
+
+    def remove_live_viewer(self, viewer_id: str) -> None:
+        """Release a WebRTC viewer's ownership of the live session."""
+        self._live_viewers.discard(viewer_id)
+
+    async def async_release_live_video(
+        self, reason: str = "live viewer closed"
+    ) -> None:
         """Release a viewer-owned live session without racing a new viewer."""
         stopped_live = False
         async with self._video_start_lock:
-            if self._video_session_purpose == VIDEO_PURPOSE_LIVE:
+            if (
+                not self._live_viewers
+                and self._video_session_purpose == VIDEO_PURPOSE_LIVE
+            ):
                 self.request_video_stop()
-                await self.async_stop_video(reason="live viewer closed")
+                await self.async_stop_video(reason=reason)
                 stopped_live = True
         if stopped_live:
             await self._ensure_vip_listener()
@@ -851,7 +761,6 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 self._config,
                 self._on_push_event,
                 init_ts=self._ctpp_init_ts,
-                on_inbound_ring=self._on_inbound_ring,
             )
             await vip.start()
             self._vip_listener = vip

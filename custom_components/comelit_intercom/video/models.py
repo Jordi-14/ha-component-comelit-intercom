@@ -17,7 +17,7 @@ class Door:
     output_index: int
     secure_mode: bool = False
     is_actuator: bool = False
-    module_index: int = 0
+    module_index: int | None = None
 
 
 @dataclass

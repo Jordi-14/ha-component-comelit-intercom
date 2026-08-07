@@ -12,8 +12,9 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .control_discovery import CONTROL_TYPE_ACTUATOR, control_identity
+from .control_discovery import control_identity
 from .coordinator import ComelitDataUpdateCoordinator
+from .entity_migration import door_control, door_unique_id
 from .video.models import Door
 
 _LOGGER = logging.getLogger(__name__)
@@ -25,7 +26,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the original Comelit door button entities."""
-    coordinator: ComelitDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator: ComelitDataUpdateCoordinator = entry.runtime_data
     doors = coordinator.device_config.doors if coordinator.device_config else []
     async_add_entities([ComelitDoorButton(coordinator, door) for door in doors])
 
@@ -47,12 +48,7 @@ class ComelitDoorButton(CoordinatorEntity[ComelitDataUpdateCoordinator], ButtonE
         self._attr_name = door.name
 
         entry_unique_id = coordinator.entry.unique_id or coordinator.host
-        control_type, apt_address, output_index, module_index = control_identity(
-            _door_control(door)
-        )
-        module_suffix = f"_{module_index}" if module_index is not None else ""
-        door_id = f"{control_type}_{apt_address}_{output_index}{module_suffix}"
-        self._attr_unique_id = f"{entry_unique_id}_{door_id}"
+        self._attr_unique_id = door_unique_id(entry_unique_id, door)
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry_unique_id)},
             name=f"Comelit Intercom ({coordinator.host})",
@@ -68,21 +64,11 @@ class ComelitDoorButton(CoordinatorEntity[ComelitDataUpdateCoordinator], ButtonE
     def available(self) -> bool:
         """Return whether this door remains present in device configuration."""
         return self.coordinator.last_update_success and any(
-            control_identity(_door_control(d))
-            == control_identity(_door_control(self._door))
+            control_identity(door_control(d))
+            == control_identity(door_control(self._door))
             for d in (
                 self.coordinator.device_config.doors
                 if self.coordinator.device_config
                 else []
             )
         )
-
-
-def _door_control(door: Door) -> dict[str, object]:
-    """Convert a door model to the stable legacy identity fields."""
-    return {
-        "control-type": CONTROL_TYPE_ACTUATOR if door.is_actuator else "door",
-        "apt-address": door.apt_address,
-        "output-index": door.output_index,
-        "module-index": door.module_index,
-    }

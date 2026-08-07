@@ -45,8 +45,8 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the intercom camera entity."""
-    coordinator: ComelitDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
-    if coordinator.device_config and coordinator.device_config.doors:
+    coordinator: ComelitDataUpdateCoordinator = entry.runtime_data
+    if coordinator.device_config and coordinator.device_config.apt_address:
         async_add_entities([ComelitIntercomCamera(coordinator)])
 
 
@@ -73,6 +73,7 @@ class ComelitIntercomCamera(Camera):
         self._remove_stop_callback: Callable[[], None] | None = None
         self._remove_state_callback: Callable[[], None] | None = None
         self._webrtc_sessions: dict[str, CameraWebRTCProvider] = {}
+        self._owned_webrtc_sessions: set[str] = set()
         self._last_image: bytes | None = None
         self._last_image_monotonic = 0.0
         self._snapshot_task: asyncio.Task[bytes | None] | None = None
@@ -189,20 +190,31 @@ class ComelitIntercomCamera(Camera):
     ) -> None:
         """Start media on demand and delegate WebRTC to HA's provider."""
         self._cancel_live_stop()
-        source = await self.stream_source()
-        for provider in self.hass.data.get(DATA_WEBRTC_PROVIDERS, set()):
-            if source and provider.async_is_supported(source):
-                self._webrtc_sessions[session_id] = provider
-                await provider.async_handle_async_webrtc_offer(
-                    self, offer_sdp, session_id, send_message
+        self._owned_webrtc_sessions.add(session_id)
+        self._coordinator.add_live_viewer(session_id)
+        delegated = False
+        try:
+            source = await self.stream_source()
+            for provider in self.hass.data.get(DATA_WEBRTC_PROVIDERS, set()):
+                if source and provider.async_is_supported(source):
+                    self._webrtc_sessions[session_id] = provider
+                    await provider.async_handle_async_webrtc_offer(
+                        self, offer_sdp, session_id, send_message
+                    )
+                    delegated = True
+                    return
+            send_message(
+                WebRTCError(
+                    code="webrtc_provider_unavailable",
+                    message="Home Assistant's go2rtc WebRTC provider is unavailable",
                 )
-                return
-        send_message(
-            WebRTCError(
-                code="webrtc_provider_unavailable",
-                message="Home Assistant's go2rtc WebRTC provider is unavailable",
             )
-        )
+        finally:
+            if not delegated:
+                self._webrtc_sessions.pop(session_id, None)
+                self._release_webrtc_viewer(session_id)
+                if not self._owned_webrtc_sessions:
+                    self._schedule_live_stop(0)
 
     async def async_on_webrtc_candidate(self, session_id: str, candidate: Any) -> None:
         """Forward a trickled ICE candidate to Home Assistant's provider."""
@@ -214,7 +226,8 @@ class ComelitIntercomCamera(Camera):
         """Close the delegated WebRTC session."""
         if provider := self._webrtc_sessions.pop(session_id, None):
             provider.async_close_session(session_id)
-        if not self._webrtc_sessions:
+        self._release_webrtc_viewer(session_id)
+        if not self._owned_webrtc_sessions:
             self._schedule_live_stop(LIVE_VIEW_CLOSE_GRACE)
 
     async def async_added_to_hass(self) -> None:
@@ -238,7 +251,14 @@ class ComelitIntercomCamera(Camera):
         if self._remove_state_callback:
             self._remove_state_callback()
             self._remove_state_callback = None
+        for session_id in tuple(self._owned_webrtc_sessions):
+            self._release_webrtc_viewer(session_id)
         await super().async_will_remove_from_hass()
+
+    def _release_webrtc_viewer(self, session_id: str) -> None:
+        """Release local and coordinator ownership for one WebRTC session."""
+        self._owned_webrtc_sessions.discard(session_id)
+        self._coordinator.remove_live_viewer(session_id)
 
     async def _async_video_state_changed(self) -> None:
         """Refresh HA's stream provider and camera state."""
@@ -298,7 +318,7 @@ class ComelitIntercomCamera(Camera):
         """Stop a viewer-owned stream after a grace period."""
         try:
             await asyncio.sleep(delay)
-            if self._webrtc_sessions:
+            if self._owned_webrtc_sessions:
                 return
             if self._coordinator.video_session_purpose != VIDEO_PURPOSE_LIVE:
                 return
