@@ -122,26 +122,6 @@ class ComelitIntercomCard extends HTMLElement {
           fill: currentColor;
           opacity: 0.72;
         }
-        .play {
-          position: absolute;
-          left: 50%;
-          top: 50%;
-          width: 64px;
-          height: 64px;
-          transform: translate(-50%, -50%);
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          border: 2px solid rgba(255, 255, 255, 0.88);
-          border-radius: 50%;
-          background: rgba(0, 0, 0, 0.52);
-          transition: transform 120ms ease, background 120ms ease;
-        }
-        .frame:hover .play {
-          transform: translate(-50%, -50%) scale(1.06);
-          background: rgba(0, 0, 0, 0.72);
-        }
-        .play svg { width: 31px; height: 31px; fill: white; margin-left: 4px; }
         .badge {
           position: absolute;
           z-index: 3;
@@ -173,10 +153,7 @@ class ComelitIntercomCard extends HTMLElement {
             <svg class="camera-icon" viewBox="0 0 24 24" aria-hidden="true">
               <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2m0 2v12h16V6H4m4 2a2 2 0 1 1 0 4 2 2 0 0 1 0-4m-2 8 3-3 2 2 3-3 4 4H6Z"/>
             </svg>
-            <img id="image" alt="Comelit intercom still" hidden />
-            <span class="play" aria-hidden="true">
-              <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7Z"/></svg>
-            </span>
+            <img id="image" alt="Comelit intercom preview" hidden />
           </div>
           <div class="live-slot" id="live-slot"></div>
           <div class="badge" id="badge">Automatic previews off</div>
@@ -217,13 +194,15 @@ class ComelitIntercomCard extends HTMLElement {
     if (!enabled) {
       this._pause();
       this._showStill();
-      this._setBadge("Automatic previews off");
+      if (this._lastStillAt) this._updateStillBadge();
+      else this._setBadge("Automatic previews off");
       return;
     }
     if (interval === null) {
       this._pause();
       this._showStill();
-      this._setBadge("Preview interval unavailable");
+      if (this._lastStillAt) this._updateStillBadge();
+      else this._setBadge("Preview interval unavailable");
       return;
     }
     if (interval === 0) {
@@ -265,7 +244,7 @@ class ComelitIntercomCard extends HTMLElement {
     const generation = this._policyGeneration;
     const controller = new AbortController();
     this._captureController = controller;
-    this._setBadge("Taking still…");
+    if (!this._lastStillAt) this._setBadge("Taking preview…");
     try {
       const entity = encodeURIComponent(this._config.camera_entity);
       const url = `/api/camera_proxy/${entity}?token=${encodeURIComponent(token)}&t=${Date.now()}`;
@@ -295,7 +274,8 @@ class ComelitIntercomCard extends HTMLElement {
     } catch (error) {
       if (error.name !== "AbortError") {
         console.warn("Comelit still preview failed", error);
-        this._setBadge("Preview failed");
+        if (this._lastStillAt) this._updateStillBadge();
+        else this._setBadge("Preview failed");
       }
     } finally {
       if (this._captureController === controller) {
@@ -400,7 +380,7 @@ class ComelitIntercomCard extends HTMLElement {
 
   _updateStillBadge() {
     if (!this._lastStillAt) {
-      this._setBadge("Waiting for still…");
+      this._setBadge("Waiting for preview…");
       return;
     }
     const time = this._lastStillAt.toLocaleTimeString([], {
@@ -408,7 +388,7 @@ class ComelitIntercomCard extends HTMLElement {
       minute: "2-digit",
       second: "2-digit",
     });
-    this._setBadge(`Still · ${time}`);
+    this._setBadge(time);
     this.shadowRoot.getElementById("badge").title = this._lastStillAt.toLocaleString();
   }
 
@@ -434,5 +414,5 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "comelit-intercom-card",
   name: "Comelit Intercom Camera",
-  description: "Privacy-aware timestamped stills with click-to-live video.",
+  description: "Privacy-aware timestamped previews with click-to-live video.",
 });

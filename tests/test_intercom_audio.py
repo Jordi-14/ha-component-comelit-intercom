@@ -410,7 +410,12 @@ def test_integration_exposes_camera_doors_and_preview_controls() -> None:
     assert not (COMPONENT_DIR / "event.py").exists()
     assert (COMPONENT_DIR / "number.py").exists()
     assert (COMPONENT_DIR / "switch.py").exists()
-    assert (COMPONENT_DIR / "www" / "comelit-intercom-card.js").exists()
+    card_source = (COMPONENT_DIR / "www" / "comelit-intercom-card.js").read_text(
+        encoding="utf-8"
+    )
+    assert "class ComelitIntercomCard" in card_source
+    assert 'class="play"' not in card_source
+    assert "Still ·" not in card_source
 
 
 @pytest.mark.asyncio

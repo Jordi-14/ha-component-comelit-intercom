@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.1
+
+- Remove the play-button overlay from still previews for an unobstructed image.
+- Show only the local capture time in the top-left corner.
+- Preserve the last capture time while refreshing, temporarily unavailable, or
+  disabled instead of replacing it with status text.
+
 ## 1.4.0
 
 - Keep the integration camera-focused: doorbell rings no longer answer or

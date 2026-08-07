@@ -1,7 +1,7 @@
 """Constants for the Comelit integration."""
 
 DOMAIN = "comelit_intercom"
-INTEGRATION_VERSION = "1.4.0"
+INTEGRATION_VERSION = "1.4.1"
 
 # Configuration keys
 CONF_HOST = "host"
