@@ -6,6 +6,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
+pytest.importorskip(
+    "homeassistant.components.number",
+    reason="Home Assistant is required for preview entity tests",
+)
+
 from custom_components.comelit_intercom.const import (
     DEFAULT_STILL_PREVIEW_INTERVAL,
     MAX_STILL_PREVIEW_INTERVAL,
