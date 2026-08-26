@@ -183,7 +183,7 @@ class IconaBridgeClient:
                 )
         return request_id, body
 
-    def set_disconnect_callback(self, callback: Callable[[], None]) -> None:
+    def set_disconnect_callback(self, callback: Callable[[], None] | None) -> None:
         """Register a callback invoked when the TCP connection drops unexpectedly.
 
         Called from the receive loop on EOF, 120s timeout, or unhandled error.
@@ -219,6 +219,10 @@ class IconaBridgeClient:
                 self._dispatch(request_id, body)
         except asyncio.IncompleteReadError:
             _LOGGER.info("Connection closed by device")
+            self._connected = False
+            unexpected = True
+        except (OSError, ConnectionComelitError) as err:
+            _LOGGER.info("Comelit transport connection lost: %s", err)
             self._connected = False
             unexpected = True
         except asyncio.CancelledError:
@@ -484,11 +488,19 @@ class IconaBridgeClient:
                 async with asyncio.timeout(CLOSE_TIMEOUT):
                     await waiter
             except TimeoutError:
-                _LOGGER.warning(
-                    "Timed out waiting for %s channel close ACK (ch=0x%04X)",
-                    name,
-                    server_channel_id,
-                )
+                if name in {"UDPM", "RTPC_DEVICE"}:
+                    _LOGGER.debug(
+                        "No %s channel close ACK; connection reset will finish "
+                        "cleanup (ch=0x%04X)",
+                        name,
+                        server_channel_id,
+                    )
+                else:
+                    _LOGGER.warning(
+                        "Timed out waiting for %s channel close ACK (ch=0x%04X)",
+                        name,
+                        server_channel_id,
+                    )
                 return False
             _LOGGER.debug("Closed channel %s (ch=0x%04X)", name, server_channel_id)
             return True

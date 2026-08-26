@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.4.2
+
+- Serialize reconnects and ignore stale disconnect callbacks so concurrent
+  refreshes cannot evict each other's ICONA connection.
+- Give the proven legacy door sequence exclusive ownership of single-client
+  panels, then always restore push notifications and the persistent transport.
+- Resume an active live camera view after door control without racing viewer
+  closure, integration shutdown, or another video negotiation.
+- Prevent in-flight reconnect and door tasks from recreating sockets, VIP
+  listeners, or keepalives after the config entry unloads.
+- Preserve the local door-open event when the command succeeds but transport
+  restoration fails, while still reporting the restoration problem.
+- Treat ordinary socket loss and known protocol cleanup/retransmit traffic as
+  expected diagnostics while retaining warnings for notification renewals.
+- Add regression coverage for concurrent reconnects, stale callbacks, door
+  success and failure, shutdown races, live-video recovery, and socket loss.
+
 ## 1.4.1
 
 - Remove the play-button overlay from still previews for an unobstructed image.

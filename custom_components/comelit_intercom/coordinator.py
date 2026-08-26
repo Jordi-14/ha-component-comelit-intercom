@@ -77,6 +77,13 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
         # The device can only handle one CTPP negotiation at a time; a second
         # concurrent call would conflict and fail ~35s later with a UDPM timeout.
         self._video_start_lock: asyncio.Lock = asyncio.Lock()
+        # Serialize connection replacement and the dedicated legacy door path.
+        # ICONA panels accept only one client, so overlapping reconnects (or a
+        # reconnect while a door command owns the panel) evict each other.
+        self._transport_lock: asyncio.Lock = asyncio.Lock()
+        # Set before unload waits for the locks so an in-flight door/reconnect
+        # cannot recreate transport resources behind the shutdown path.
+        self._shutting_down: bool = False
         # Fires when a video session becomes ready — allows stream_source()
         # to wait briefly instead of returning None while CTPP is in flight.
         self._video_ready_event: asyncio.Event = asyncio.Event()
@@ -195,7 +202,7 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
             raise
 
         self._client = client
-        client.set_disconnect_callback(self._on_client_disconnect)
+        client.set_disconnect_callback(lambda: self._on_client_disconnect(client))
 
         # Start VIP event listener for doorbell ring detection, unless disabled.
         # The PUSH channel is one-shot FCM registration; actual call events
@@ -232,8 +239,31 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
             len(self._config.cameras),
         )
 
-    async def _reconnect(self) -> None:
-        """Tear down old connection and re-establish everything."""
+    async def _reconnect(self, *, force: bool = False) -> None:
+        """Serialize reconnects and avoid replacing a connection already restored."""
+        client_to_replace = self._client
+        async with self._transport_lock:
+            if self._shutting_down:
+                return
+            # Several callers can observe the same disconnect. The first one
+            # restores the transport; later waiters must use that connection
+            # instead of immediately evicting it with another ICONA login. A
+            # forced reset is still skipped if another waiter already replaced
+            # the exact client this caller observed.
+            if (
+                self._client is not None
+                and self._client.connected
+                and self._config is not None
+                and (not force or self._client is not client_to_replace)
+            ):
+                _LOGGER.debug("Reconnect skipped — connection already restored")
+                return
+            await self._reconnect_locked()
+
+    async def _reconnect_locked(self) -> None:
+        """Replace the persistent transport while ``_transport_lock`` is held."""
+        if self._shutting_down:
+            return
         self._cancel_keepalive()
         # Stop any active video session before disconnecting — a concurrent
         # session.start() holds a reference to the old client and will hang
@@ -257,6 +287,10 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
         old_client = self._client
         self._client = None
         if old_client:
+            # A planned teardown must not schedule a competing refresh. The
+            # client-specific callback also protects against a late callback
+            # that was already queued before it was detached.
+            old_client.set_disconnect_callback(None)
             try:
                 await old_client.disconnect()
             except Exception:
@@ -275,7 +309,7 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
             raise
 
         self._client = client
-        client.set_disconnect_callback(self._on_client_disconnect)
+        client.set_disconnect_callback(lambda: self._on_client_disconnect(client))
 
         if self.config_entry.options.get(CONF_ENABLE_NOTIFICATIONS, True):  # type: ignore[union-attr]
             try:
@@ -301,20 +335,25 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
 
     async def async_shutdown(self) -> None:
         """Disconnect from the device."""
-        self._cancel_keepalive()
-        await self.async_stop_video(reason="shutdown")
-        if self._vip_listener:
-            with contextlib.suppress(Exception):
-                await self._vip_listener.stop()
-            self._vip_listener = None
-        if self._rtsp_server:
-            with contextlib.suppress(Exception):
-                await self._rtsp_server.stop()
-            self._rtsp_server = None
-            self._rtsp_url = None
-        if self._client:
-            await self._client.disconnect()
-            self._client = None
+        self._shutting_down = True
+        async with self._video_start_lock:
+            async with self._transport_lock:
+                self._cancel_keepalive()
+                await self.async_stop_video(reason="shutdown", reset_transport=False)
+                if self._vip_listener:
+                    with contextlib.suppress(Exception):
+                        await self._vip_listener.stop()
+                    self._vip_listener = None
+                if self._rtsp_server:
+                    with contextlib.suppress(Exception):
+                        await self._rtsp_server.stop()
+                    self._rtsp_server = None
+                    self._rtsp_url = None
+                client = self._client
+                self._client = None
+                if client:
+                    client.set_disconnect_callback(None)
+                    await client.disconnect()
 
     async def async_setup_video(self) -> None:
         """Set up the persistent ICONA, event, media, and RTSP paths."""
@@ -375,6 +414,8 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
 
     async def async_open_door(self, door: Door) -> None:
         """Open a door using the dedicated path proven by the original fork."""
+        if self._shutting_down:
+            raise HomeAssistantError("Comelit integration is shutting down")
         if not self._config or not self._config.raw:
             raise RuntimeError("Not connected")
         vip = self._config.raw.get("vip")
@@ -392,41 +433,126 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
         }
         if door.module_index is not None:
             control["module-index"] = door.module_index
-        door_client = LegacyDoorClient(self.host, self.port)
-        try:
-            await door_client.connect()
-            auth_code = await door_client.authenticate(self.token)
-            if auth_code != 200:
-                raise HomeAssistantError(
-                    f"Comelit authentication failed with code {auth_code}"
+        door_error: HomeAssistantError | None = None
+        door_cause: Exception | None = None
+        restore_error: Exception | None = None
+        door_succeeded = False
+        restart_live_video = False
+        live_video_was_viewer_owned = False
+
+        # Prevent a video negotiation from racing this exclusive takeover.
+        # The transport lock also keeps a background refresh from stopping the
+        # same video session concurrently. Door control always rebuilds the
+        # transport below, so video cleanup does not need a separate reset.
+        async with self._video_start_lock:
+            active_session = self._video_session
+            restart_live_video = bool(
+                active_session
+                and active_session.active
+                and self._video_session_purpose == VIDEO_PURPOSE_LIVE
+                and not self._video_stopped_by_user
+            )
+            live_video_was_viewer_owned = bool(self._live_viewers)
+            async with self._transport_lock:
+                if self._shutting_down:
+                    raise HomeAssistantError("Comelit integration is shutting down")
+                await self.async_stop_video(
+                    reason="door control", reset_transport=False
                 )
-            if door.is_actuator:
-                await door_client.open_actuator(vip, control)
-            else:
-                await door_client.open_door(vip, control)
-            _LOGGER.info(
-                "Door '%s' opened with dedicated legacy sequence "
-                "(target=%s, output=%d)",
-                door.name,
-                door.apt_address,
-                door.output_index,
+                self._cancel_keepalive()
+                if self._vip_listener:
+                    with contextlib.suppress(Exception):
+                        await self._vip_listener.stop()
+                    self._vip_listener = None
+
+                # The panel supports one ICONA client. Deliberately release the
+                # persistent client before starting the proven legacy sequence,
+                # then rebuild it regardless of the door-command outcome.
+                persistent_client = self._client
+                self._client = None
+                if persistent_client:
+                    persistent_client.set_disconnect_callback(None)
+                    with contextlib.suppress(Exception):
+                        await persistent_client.disconnect()
+
+                door_client = LegacyDoorClient(self.host, self.port)
+                try:
+                    await door_client.connect()
+                    auth_code = await door_client.authenticate(self.token)
+                    if auth_code != 200:
+                        raise HomeAssistantError(
+                            f"Comelit authentication failed with code {auth_code}"
+                        )
+                    if door.is_actuator:
+                        await door_client.open_actuator(vip, control)
+                    else:
+                        await door_client.open_door(vip, control)
+                    door_succeeded = True
+                    _LOGGER.info(
+                        "Door '%s' opened with dedicated legacy sequence "
+                        "(target=%s, output=%d)",
+                        door.name,
+                        door.apt_address,
+                        door.output_index,
+                    )
+                except HomeAssistantError as err:
+                    door_error = err
+                except Exception as err:
+                    door_cause = err
+                    door_error = HomeAssistantError(
+                        f"Failed to open {door.name or 'Comelit control'}: {err}"
+                    )
+                finally:
+                    with contextlib.suppress(Exception):
+                        await door_client.shutdown()
+                    if not self._shutting_down:
+                        try:
+                            await self._reconnect_locked()
+                        except Exception as err:
+                            self._connection_lost = True
+                            restore_error = err
+                            if door_error is not None:
+                                _LOGGER.error(
+                                    "Persistent Comelit connection could not be "
+                                    "restored after a failed door command",
+                                    exc_info=True,
+                                )
+
+        if door_succeeded:
+            self._on_push_event(
+                PushEvent(
+                    event_type="door_opened",
+                    apt_address=door.apt_address,
+                    timestamp=time.time(),
+                    raw={"door": door.name, "output_index": door.output_index},
+                )
             )
-        except HomeAssistantError:
-            raise
-        except Exception as err:
+        if (
+            restart_live_video
+            and restore_error is None
+            and not self._shutting_down
+            and not self._video_stopped_by_user
+            and (not live_video_was_viewer_owned or self._live_viewers)
+        ):
+            try:
+                await self.async_start_video(
+                    auto_timeout=False, purpose=VIDEO_PURPOSE_LIVE
+                )
+            except Exception:
+                # Door control already completed (or failed independently), so
+                # a best-effort preview recovery must not change its result.
+                _LOGGER.warning(
+                    "Unable to resume live video after door control", exc_info=True
+                )
+        if door_error is not None:
+            if door_cause is not None:
+                raise door_error from door_cause
+            raise door_error
+        if restore_error is not None:
             raise HomeAssistantError(
-                f"Failed to open {door.name or 'Comelit control'}: {err}"
-            ) from err
-        finally:
-            await door_client.shutdown()
-        self._on_push_event(
-            PushEvent(
-                event_type="door_opened",
-                apt_address=door.apt_address,
-                timestamp=time.time(),
-                raw={"door": door.name, "output_index": door.output_index},
-            )
-        )
+                "Door command was sent, but the persistent Comelit connection "
+                f"could not be restored: {restore_error}"
+            ) from restore_error
 
     async def async_open_control(self, control: dict[str, object]) -> None:
         """Open a discovered legacy control using the richer door model."""
@@ -584,7 +710,7 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
                         "Resetting Comelit connection after incomplete video cleanup"
                     )
                     try:
-                        await self._reconnect()
+                        await self._reconnect(force=True)
                     except Exception:
                         _LOGGER.warning(
                             "Failed to reset connection after video start failure",
@@ -768,7 +894,9 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
         except Exception:
             _LOGGER.warning("Failed to restart VIP listener", exc_info=True)
 
-    async def async_stop_video(self, reason: str = "user stopped") -> None:
+    async def async_stop_video(
+        self, reason: str = "user stopped", *, reset_transport: bool = True
+    ) -> None:
         """Stop the active video call session.
 
         Snapshots _video_session and clears it immediately so a concurrent
@@ -797,14 +925,15 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 _LOGGER.exception("Error in stop-video callback")
 
         await session.stop(reason=reason)
-        if session.cleanup_requires_reconnect and reason not in (
-            "reconnect",
-            "shutdown",
+        if (
+            reset_transport
+            and session.cleanup_requires_reconnect
+            and reason not in ("reconnect", "shutdown")
         ):
             _LOGGER.info(
                 "Resetting Comelit connection to finish releasing video channels"
             )
-            await self._reconnect()
+            await self._reconnect(force=True)
         # Block future PLAYs until the next session is ready, and
         # kick any remaining RTSP clients (e.g. go2rtc) so they
         # reconnect fresh against a stream that already has video.
@@ -833,15 +962,16 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[DeviceConfig]):
         """Return a monotonic identifier for the current media session."""
         return self._video_stream_revision
 
-    def _on_client_disconnect(self) -> None:
+    def _on_client_disconnect(self, client: IconaBridgeClient) -> None:
         """Called by the TCP client when the connection drops unexpectedly.
 
         Schedules an immediate coordinator refresh so _async_update_data runs
         within milliseconds and triggers reconnect, instead of waiting for the
         next 30-second polling interval.
         """
-        if self._client is None:
-            return  # already shut down
+        if self._shutting_down or client is not self._client:
+            _LOGGER.debug("Ignoring disconnect from stale Comelit client")
+            return
         if self._video_session and self._video_session.active:
             self._record_unexpected_video_end()
         if not self._connection_lost:

@@ -117,6 +117,20 @@ async def test_door_buttons_use_proven_dedicated_legacy_sequence(
     coordinator._config = DeviceConfig(
         raw={"vip": {"apt-address": "SB000001", "apt-subaddress": 1}}
     )
+    coordinator._video_start_lock = asyncio.Lock()
+    coordinator._transport_lock = asyncio.Lock()
+    coordinator._shutting_down = False
+    coordinator._video_session = None
+    coordinator._video_session_purpose = None
+    coordinator._video_stopped_by_user = False
+    coordinator._live_viewers = set()
+    coordinator._vip_listener = None
+    coordinator._client = MagicMock()
+    coordinator._client.disconnect = AsyncMock()
+    coordinator._client.set_disconnect_callback = MagicMock()
+    coordinator._cancel_keepalive = MagicMock()
+    coordinator.async_stop_video = AsyncMock()
+    coordinator._reconnect_locked = AsyncMock()
     coordinator._on_push_event = MagicMock()
     door = Door(
         id=1,
@@ -145,6 +159,287 @@ async def test_door_buttons_use_proven_dedicated_legacy_sequence(
         client.open_door.assert_awaited_once()
         client.open_actuator.assert_not_awaited()
     client.shutdown.assert_awaited_once()
+    coordinator.async_stop_video.assert_awaited_once_with(
+        reason="door control", reset_transport=False
+    )
+    assert coordinator._client is None
+    coordinator._reconnect_locked.assert_awaited_once()
+    coordinator._on_push_event.assert_called_once()
+
+
+@pytest.mark.asyncio
+@requires_homeassistant
+async def test_failed_door_command_still_restores_persistent_transport() -> None:
+    """A rejected legacy command must not leave push and video disconnected."""
+    coordinator = coordinator_module.ComelitDataUpdateCoordinator.__new__(
+        coordinator_module.ComelitDataUpdateCoordinator
+    )
+    coordinator.host = "192.0.2.1"
+    coordinator.port = 64100
+    coordinator.token = "token"
+    coordinator._config = DeviceConfig(raw={"vip": {}})
+    coordinator._video_start_lock = asyncio.Lock()
+    coordinator._transport_lock = asyncio.Lock()
+    coordinator._shutting_down = False
+    coordinator._video_session = None
+    coordinator._video_session_purpose = None
+    coordinator._video_stopped_by_user = False
+    coordinator._live_viewers = set()
+    coordinator._vip_listener = None
+    coordinator._client = None
+    coordinator._cancel_keepalive = MagicMock()
+    coordinator.async_stop_video = AsyncMock()
+    coordinator._reconnect_locked = AsyncMock()
+    coordinator._on_push_event = MagicMock()
+    door = Door(
+        id=1,
+        index=1,
+        name="Entrance",
+        apt_address="SB100001",
+        output_index=1,
+    )
+    client = MagicMock()
+    client.connect = AsyncMock()
+    client.authenticate = AsyncMock(return_value=200)
+    client.open_door = AsyncMock(side_effect=ConnectionResetError("panel busy"))
+    client.shutdown = AsyncMock()
+
+    with (
+        patch.object(coordinator_module, "LegacyDoorClient", return_value=client),
+        pytest.raises(_HomeAssistantError, match="panel busy"),
+    ):
+        await coordinator.async_open_door(door)
+
+    client.shutdown.assert_awaited_once()
+    coordinator._reconnect_locked.assert_awaited_once()
+    coordinator._on_push_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+@requires_homeassistant
+async def test_successful_door_event_survives_transport_restore_failure() -> None:
+    """Report physical door success even if rebuilding push/video fails."""
+    coordinator = coordinator_module.ComelitDataUpdateCoordinator.__new__(
+        coordinator_module.ComelitDataUpdateCoordinator
+    )
+    coordinator.host = "192.0.2.1"
+    coordinator.port = 64100
+    coordinator.token = "token"
+    coordinator._config = DeviceConfig(raw={"vip": {}})
+    coordinator._video_start_lock = asyncio.Lock()
+    coordinator._transport_lock = asyncio.Lock()
+    coordinator._shutting_down = False
+    coordinator._video_session = None
+    coordinator._video_session_purpose = None
+    coordinator._video_stopped_by_user = False
+    coordinator._live_viewers = set()
+    coordinator._vip_listener = None
+    coordinator._client = None
+    coordinator._connection_lost = False
+    coordinator._cancel_keepalive = MagicMock()
+    coordinator.async_stop_video = AsyncMock()
+    coordinator._reconnect_locked = AsyncMock(
+        side_effect=ConnectionResetError("restore failed")
+    )
+    coordinator._on_push_event = MagicMock()
+    door = Door(
+        id=1,
+        index=1,
+        name="Entrance",
+        apt_address="SB100001",
+        output_index=1,
+    )
+    client = MagicMock()
+    client.connect = AsyncMock()
+    client.authenticate = AsyncMock(return_value=200)
+    client.open_door = AsyncMock()
+    client.shutdown = AsyncMock()
+
+    with (
+        patch.object(coordinator_module, "LegacyDoorClient", return_value=client),
+        pytest.raises(_HomeAssistantError, match="could not be restored"),
+    ):
+        await coordinator.async_open_door(door)
+
+    coordinator._on_push_event.assert_called_once()
+    assert coordinator._on_push_event.call_args.args[0].event_type == "door_opened"
+    assert coordinator._connection_lost is True
+
+
+@pytest.mark.asyncio
+@requires_homeassistant
+async def test_door_control_resumes_live_video_started_while_waiting() -> None:
+    """Snapshot live state only after door control owns the video-start lock."""
+    coordinator = coordinator_module.ComelitDataUpdateCoordinator.__new__(
+        coordinator_module.ComelitDataUpdateCoordinator
+    )
+    coordinator.host = "192.0.2.1"
+    coordinator.port = 64100
+    coordinator.token = "token"
+    coordinator._config = DeviceConfig(raw={"vip": {}})
+    coordinator._video_start_lock = asyncio.Lock()
+    coordinator._transport_lock = asyncio.Lock()
+    coordinator._shutting_down = False
+    coordinator._video_session = None
+    coordinator._video_session_purpose = None
+    coordinator._video_stopped_by_user = False
+    coordinator._live_viewers = set()
+    coordinator._vip_listener = None
+    coordinator._client = None
+    coordinator._cancel_keepalive = MagicMock()
+    coordinator.async_stop_video = AsyncMock()
+    coordinator.async_start_video = AsyncMock()
+    coordinator._reconnect_locked = AsyncMock()
+    coordinator._on_push_event = MagicMock()
+    door = Door(
+        id=1,
+        index=1,
+        name="Entrance",
+        apt_address="SB100001",
+        output_index=1,
+    )
+    client = MagicMock()
+    client.connect = AsyncMock()
+    client.authenticate = AsyncMock(return_value=200)
+    client.open_door = AsyncMock()
+    client.shutdown = AsyncMock()
+
+    await coordinator._video_start_lock.acquire()
+    with patch.object(coordinator_module, "LegacyDoorClient", return_value=client):
+        door_task = asyncio.create_task(coordinator.async_open_door(door))
+        await asyncio.sleep(0)
+        coordinator._video_session = MagicMock(active=True)
+        coordinator._video_session_purpose = coordinator_module.VIDEO_PURPOSE_LIVE
+        coordinator._live_viewers.add("viewer")
+        coordinator._video_start_lock.release()
+        await door_task
+
+    coordinator.async_start_video.assert_awaited_once_with(
+        auto_timeout=False, purpose=coordinator_module.VIDEO_PURPOSE_LIVE
+    )
+
+
+@pytest.mark.asyncio
+@requires_homeassistant
+async def test_shutdown_during_door_command_does_not_reconnect() -> None:
+    """Unload waits for door ownership and prevents post-unload resource recreation."""
+    coordinator = coordinator_module.ComelitDataUpdateCoordinator.__new__(
+        coordinator_module.ComelitDataUpdateCoordinator
+    )
+    coordinator.host = "192.0.2.1"
+    coordinator.port = 64100
+    coordinator.token = "token"
+    coordinator._config = DeviceConfig(raw={"vip": {}})
+    coordinator._video_start_lock = asyncio.Lock()
+    coordinator._transport_lock = asyncio.Lock()
+    coordinator._shutting_down = False
+    coordinator._video_session = None
+    coordinator._video_session_purpose = None
+    coordinator._video_stopped_by_user = False
+    coordinator._live_viewers = set()
+    coordinator._vip_listener = None
+    coordinator._rtsp_server = None
+    coordinator._rtsp_url = None
+    coordinator._client = MagicMock()
+    coordinator._client.disconnect = AsyncMock()
+    coordinator._client.set_disconnect_callback = MagicMock()
+    coordinator._cancel_keepalive = MagicMock()
+    coordinator.async_stop_video = AsyncMock()
+    coordinator._reconnect_locked = AsyncMock()
+    coordinator._on_push_event = MagicMock()
+    door = Door(
+        id=1,
+        index=1,
+        name="Entrance",
+        apt_address="SB100001",
+        output_index=1,
+    )
+    command_started = asyncio.Event()
+    release_command = asyncio.Event()
+
+    async def _open_door(*_args: object) -> None:
+        command_started.set()
+        await release_command.wait()
+
+    client = MagicMock()
+    client.connect = AsyncMock()
+    client.authenticate = AsyncMock(return_value=200)
+    client.open_door = AsyncMock(side_effect=_open_door)
+    client.shutdown = AsyncMock()
+
+    with patch.object(coordinator_module, "LegacyDoorClient", return_value=client):
+        door_task = asyncio.create_task(coordinator.async_open_door(door))
+        await command_started.wait()
+        shutdown_task = asyncio.create_task(coordinator.async_shutdown())
+        await asyncio.sleep(0)
+        assert coordinator._shutting_down is True
+        release_command.set()
+        await asyncio.gather(door_task, shutdown_task)
+
+    coordinator._reconnect_locked.assert_not_awaited()
+    assert coordinator._client is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("force", [False, True])
+@requires_homeassistant
+async def test_concurrent_reconnects_replace_transport_only_once(force: bool) -> None:
+    """Refreshes observing one outage must not evict each other's new client."""
+    coordinator = coordinator_module.ComelitDataUpdateCoordinator.__new__(
+        coordinator_module.ComelitDataUpdateCoordinator
+    )
+    coordinator._transport_lock = asyncio.Lock()
+    coordinator._shutting_down = False
+    coordinator._client = None
+    coordinator._config = MagicMock()
+
+    async def _restore() -> None:
+        await asyncio.sleep(0)
+        coordinator._client = MagicMock(connected=True)
+
+    coordinator._reconnect_locked = AsyncMock(side_effect=_restore)
+
+    await asyncio.gather(
+        coordinator._reconnect(force=force), coordinator._reconnect(force=force)
+    )
+
+    coordinator._reconnect_locked.assert_awaited_once()
+
+
+@requires_homeassistant
+def test_stale_client_disconnect_does_not_start_another_reconnect() -> None:
+    """A late callback from a retired socket cannot replace the live socket."""
+    coordinator = coordinator_module.ComelitDataUpdateCoordinator.__new__(
+        coordinator_module.ComelitDataUpdateCoordinator
+    )
+    coordinator._client = MagicMock()
+    coordinator._shutting_down = False
+    coordinator._connection_lost = False
+    coordinator._video_session = None
+    coordinator.config_entry = MagicMock()
+
+    coordinator._on_client_disconnect(MagicMock())
+
+    assert coordinator._connection_lost is False
+    coordinator.config_entry.async_create_background_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_receive_loop_treats_socket_loss_as_expected_disconnect(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A network reset should notify the coordinator without an error traceback."""
+    client = IconaBridgeClient("192.0.2.1")
+    client._connected = True
+    client._read_packet = AsyncMock(side_effect=ConnectionResetError("reset"))
+    callback = MagicMock()
+    client.set_disconnect_callback(callback)
+
+    with caplog.at_level(logging.ERROR):
+        await client._receive_loop()
+
+    callback.assert_called_once()
+    assert not caplog.records
 
 
 def _camera_coordinator() -> MagicMock:
