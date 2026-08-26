@@ -44,14 +44,8 @@ def control_identity(control: dict[str, Any]) -> tuple[str, str, int, int | None
 
 def _normalize_opendoor_entries(entries: Any) -> list[dict[str, Any]]:
     """Normalize standard open-door entries."""
-    if not isinstance(entries, list):
-        return []
-
     controls: list[dict[str, Any]] = []
-    for index, entry in enumerate(entries, start=1):
-        if not isinstance(entry, dict):
-            continue
-
+    for index, entry in enumerate(_as_entries(entries), start=1):
         apt_address = _first_string(entry, "apt-address")
         output_index = _coerce_int(entry.get("output-index"))
         if apt_address is None or output_index is None:
@@ -75,15 +69,8 @@ def _normalize_actuator_entries(
     additional_entries: Any,
 ) -> list[dict[str, Any]]:
     """Normalize actuator entries using the same data model as comelit-client."""
-    if not isinstance(actuator_entries, list):
-        return []
-
-    supplemental_by_index = [
-        entry if isinstance(entry, dict) else {}
-        for entry in (
-            additional_entries if isinstance(additional_entries, list) else []
-        )
-    ]
+    actuator_entries = _as_entries(actuator_entries)
+    supplemental_by_index = _as_entries(additional_entries)
     supplemental_by_address: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for entry in supplemental_by_index:
         apt_address = _first_string(entry, "apt-address")
@@ -226,3 +213,12 @@ def _merge_non_empty(target: dict[str, Any], source: dict[str, Any]) -> None:
         if value in (None, "", [], {}):
             continue
         target[key] = value
+
+
+def _as_entries(value: Any) -> list[dict[str, Any]]:
+    """Return address-book entries from list and singleton firmware shapes."""
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [entry for entry in value if isinstance(entry, dict)]
+    return []

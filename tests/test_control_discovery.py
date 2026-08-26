@@ -192,6 +192,44 @@ class ExtractControlsFromVipTests(unittest.TestCase):
 
         self.assertNotEqual(control_identity(door), control_identity(actuator))
 
+    def test_accepts_singleton_address_books_from_older_firmware(self) -> None:
+        """A one-item object must be handled like a one-item JSON array."""
+        controls = extract_controls_from_vip(
+            {
+                "user-parameters": {
+                    "opendoor-address-book": {
+                        "name": "Entrance",
+                        "apt-address": "SB100001",
+                        "output-index": 1,
+                    },
+                    "actuator-address-book": {
+                        "name": "Garage",
+                        "apt-address": "SBIO0255",
+                    },
+                    "additional-actuator": {
+                        "apt-address": "SBIO0255",
+                        "module-index": 255,
+                        "output-index": 2,
+                        "enabled": True,
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(len(controls), 2)
+        self.assertEqual(controls[0]["control-type"], CONTROL_TYPE_OPENDOOR)
+        self.assertEqual(
+            controls[1],
+            {
+                "control-type": CONTROL_TYPE_ACTUATOR,
+                "name": "Garage",
+                "apt-address": "SBIO0255",
+                "module-index": 255,
+                "output-index": 2,
+                "enabled": True,
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
