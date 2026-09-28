@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
@@ -15,6 +14,8 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .control_discovery import control_identity
 from .coordinator import ComelitDataUpdateCoordinator
+from .entity_migration import door_control, door_unique_id
+from .video.models import Door
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,17 +25,10 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Comelit button entities."""
-    coordinator: ComelitDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
-
-    # Create button entities for each door
-    entities = []
-    doors = (coordinator.data or {}).get("doors", [])
-
-    for door in doors:
-        entities.append(ComelitDoorButton(coordinator, door))
-
-    async_add_entities(entities)
+    """Set up the original Comelit door button entities."""
+    coordinator: ComelitDataUpdateCoordinator = entry.runtime_data
+    doors = coordinator.device_config.doors if coordinator.device_config else []
+    async_add_entities([ComelitDoorButton(coordinator, door) for door in doors])
 
 
 class ComelitDoorButton(CoordinatorEntity[ComelitDataUpdateCoordinator], ButtonEntity):
@@ -46,21 +40,15 @@ class ComelitDoorButton(CoordinatorEntity[ComelitDataUpdateCoordinator], ButtonE
     def __init__(
         self,
         coordinator: ComelitDataUpdateCoordinator,
-        door: dict[str, Any],
+        door: Door,
     ) -> None:
-        """Initialize the button."""
+        """Initialize the button with its existing stable entity identity."""
         super().__init__(coordinator)
         self._door = door
-        self._attr_name = door.get("name", "Unknown Door")
+        self._attr_name = door.name
 
-        # Create unique ID based on host and door details
         entry_unique_id = coordinator.entry.unique_id or coordinator.host
-        control_type, apt_address, output_index, module_index = control_identity(door)
-        module_suffix = f"_{module_index}" if module_index is not None else ""
-        door_id = f"{control_type}_{apt_address}_{output_index}{module_suffix}"
-        self._attr_unique_id = f"{entry_unique_id}_{door_id}"
-
-        # Set device info
+        self._attr_unique_id = door_unique_id(entry_unique_id, door)
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry_unique_id)},
             name=f"Comelit Intercom ({coordinator.host})",
@@ -69,13 +57,18 @@ class ComelitDoorButton(CoordinatorEntity[ComelitDataUpdateCoordinator], ButtonE
         )
 
     async def async_press(self) -> None:
-        """Handle the button press."""
-        await self.coordinator.async_open_control(self._door)
+        """Open this door using the proven dedicated legacy connection."""
+        await self.coordinator.async_open_door(self._door)
 
     @property
     def available(self) -> bool:
-        """Return if entity is available."""
+        """Return whether this door remains present in device configuration."""
         return self.coordinator.last_update_success and any(
-            control_identity(d) == control_identity(self._door)
-            for d in (self.coordinator.data or {}).get("doors", [])
+            control_identity(door_control(d))
+            == control_identity(door_control(self._door))
+            for d in (
+                self.coordinator.device_config.doors
+                if self.coordinator.device_config
+                else []
+            )
         )

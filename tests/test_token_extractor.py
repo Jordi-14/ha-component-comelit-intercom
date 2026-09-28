@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import importlib.util
 import io
 import sys
@@ -10,6 +11,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 if "aiohttp" not in sys.modules:
     try:
@@ -97,6 +99,17 @@ class SafeExtractTarTests(unittest.TestCase):
             self.assertFalse((destination / "etc/comelit/users.cfg").exists())
             self.assertFalse((Path(tmpdir) / "escape.txt").exists())
 
+    def test_rejects_oversized_archive_member(self) -> None:
+        backup = _make_tar_gz([("etc/comelit/users.cfg", b"123456789")])
+
+        with (
+            patch.object(TOKEN_EXTRACTOR, "MAX_MEMBER_BYTES", 8),
+            tempfile.TemporaryDirectory() as tmpdir,
+            tarfile.open(fileobj=io.BytesIO(backup), mode="r:gz") as tar,
+            self.assertRaises(tarfile.TarError),
+        ):
+            safe_extract_tar(tar, Path(tmpdir) / "extract")
+
 
 class ExtractTokenFromBackupTests(unittest.IsolatedAsyncioTestCase):
     """Verify token extraction from safe backup contents."""
@@ -106,6 +119,12 @@ class ExtractTokenFromBackupTests(unittest.IsolatedAsyncioTestCase):
         backup = _make_tar_gz([("etc/comelit/users.cfg", f'9:4:"{token}"'.encode())])
 
         self.assertEqual(await extract_token_from_backup(backup), token)
+
+    async def test_rejects_gzip_expansion_beyond_users_config_limit(self) -> None:
+        backup = _make_tar_gz([("etc/comelit/users.cfg", gzip.compress(b"x" * 65))])
+
+        with patch.object(TOKEN_EXTRACTOR, "MAX_USERS_CONFIG_BYTES", 64):
+            self.assertIsNone(await extract_token_from_backup(backup))
 
 
 if __name__ == "__main__":

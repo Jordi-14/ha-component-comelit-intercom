@@ -19,6 +19,12 @@ import aiohttp
 
 _LOGGER = logging.getLogger(__name__)
 
+MAX_BACKUP_DOWNLOAD_BYTES = 16 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 1_000
+MAX_EXTRACTED_BYTES = 64 * 1024 * 1024
+MAX_MEMBER_BYTES = 16 * 1024 * 1024
+MAX_USERS_CONFIG_BYTES = 4 * 1024 * 1024
+
 
 def _validate_tar_member_path(member_name: str) -> None:
     """Validate that a tar member path cannot escape the extraction directory."""
@@ -60,10 +66,20 @@ def _safe_extract_tar(tar: tarfile.TarFile, destination: Path) -> None:
     """Safely extract regular files and directories from a tar archive."""
     destination.mkdir(parents=True, exist_ok=True)
     resolved_destination = destination.resolve()
-
+    members = tar.getmembers()
+    if len(members) > MAX_ARCHIVE_MEMBERS:
+        raise tarfile.TarError("Backup contains too many archive members")
+    total_size = 0
+    for member in members:
+        if member.size < 0 or member.size > MAX_MEMBER_BYTES:
+            raise tarfile.TarError(f"Backup member is too large: {member.name!r}")
+        if member.isfile():
+            total_size += member.size
+            if total_size > MAX_EXTRACTED_BYTES:
+                raise tarfile.TarError("Backup expands beyond the safe size limit")
     validated_members = [
         (member, _validated_tar_target(resolved_destination, member))
-        for member in tar.getmembers()
+        for member in members
     ]
 
     for member, target in validated_members:
@@ -78,6 +94,36 @@ def _safe_extract_tar(tar: tarfile.TarFile, destination: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         with source, target.open("wb") as output:
             shutil.copyfileobj(source, output)
+
+
+async def _read_backup_response(resp: aiohttp.ClientResponse) -> bytes | None:
+    """Read a backup response without allowing an unbounded download."""
+    if (
+        resp.content_length is not None
+        and resp.content_length > MAX_BACKUP_DOWNLOAD_BYTES
+    ):
+        return None
+    backup = bytearray()
+    async for chunk in resp.content.iter_chunked(64 * 1024):
+        if len(backup) + len(chunk) > MAX_BACKUP_DOWNLOAD_BYTES:
+            return None
+        backup.extend(chunk)
+    return bytes(backup)
+
+
+def _read_users_config(file_path: Path) -> str:
+    """Decode users.cfg while limiting plain and gzip-expanded data."""
+    with file_path.open("rb") as file:
+        magic = file.read(2)
+    if magic == b"\x1f\x8b":
+        with gzip.open(file_path, "rb") as file:
+            content = file.read(MAX_USERS_CONFIG_BYTES + 1)
+    else:
+        with file_path.open("rb") as file:
+            content = file.read(MAX_USERS_CONFIG_BYTES + 1)
+    if len(content) > MAX_USERS_CONFIG_BYTES:
+        raise OSError("users.cfg expands beyond the safe size limit")
+    return content.decode("utf-8", errors="ignore")
 
 
 async def extract_token(
@@ -174,7 +220,10 @@ async def extract_token(
                     _LOGGER.error(f"Failed to download backup: {resp.status}")
                     return None
 
-                backup_data = await resp.read()
+                backup_data = await _read_backup_response(resp)
+                if backup_data is None:
+                    _LOGGER.error("Backup exceeds the safe download size limit")
+                    return None
                 _LOGGER.info(f"Downloaded {len(backup_data)} bytes")
 
             # Step 6: Extract token from backup
@@ -190,6 +239,9 @@ async def extract_token(
 
 async def extract_token_from_backup(backup_data: bytes) -> str | None:
     """Extract token from backup archive."""
+    if len(backup_data) > MAX_BACKUP_DOWNLOAD_BYTES:
+        _LOGGER.error("Backup exceeds the safe archive size limit")
+        return None
     try:
         loop = asyncio.get_event_loop()
 
@@ -215,18 +267,12 @@ async def extract_token_from_backup(backup_data: bytes) -> str | None:
                             file_path = Path(root) / file
                             _LOGGER.debug(f"Found {file} at: {file_path}")
 
-                            # Some firmware versions gzip the users.cfg file even without
-                            # a .gz extension. Check the magic bytes to detect this.
-                            with open(file_path, "rb") as f:
-                                magic = f.read(2)
-
-                            content: str
-                            if magic == b"\x1f\x8b":  # gzip magic number (1f 8b)
-                                _LOGGER.debug("users.cfg is gzipped, decompressing...")
-                                with gzip.open(file_path, "rb") as f:
-                                    content = f.read().decode("utf-8", errors="ignore")
-                            else:
-                                content = file_path.read_text(errors="ignore")
+                            # Some firmware gzip users.cfg without adding .gz.
+                            try:
+                                content = _read_users_config(file_path)
+                            except OSError as err:
+                                _LOGGER.error("Unable to read users.cfg: %s", err)
+                                return None
 
                             _LOGGER.debug(f"users.cfg size: {len(content)} bytes")
 
