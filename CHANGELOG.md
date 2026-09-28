@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.3
+
+- Publish the tested camera and transport changes on the main branch.
+
 ## 1.4.2
 
 - Serialize reconnects and ignore stale disconnect callbacks so concurrent
